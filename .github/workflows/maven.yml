@@ -27,10 +27,10 @@ jobs:
           repository: debezium/debezium
           ref: ${{ github.ref }}
           path: core
-      - name: Checkout Milvus connector
+      - name: Checkout TiDB connector
         uses: actions/checkout@v7
         with:
-          path: milvus
+          path: tidb
       - name: Set up JDK
         uses: actions/setup-java@v5
         with:
@@ -43,6 +43,6 @@ jobs:
           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
           restore-keys: ${{ runner.os }}-m2
       - name: Maven build core
-        run: ./milvus/mvnw clean install -f core/pom.xml -pl debezium-bom,debezium-connector-common,debezium-util,debezium-config,debezium-embedded,debezium-storage,debezium-connect-plugins -am -DskipTests -DskipITs -Dformat.formatter.goal=validate -Dformat.imports.goal=check -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
-      - name: Maven build Milvus
-        run: ./milvus/mvnw clean install -f milvus/pom.xml -Passembly -Dformat.formatter.goal=validate -Dformat.imports.goal=check -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -DfailFlakyTests=false -Ddebezium.test.records.waittime=5
+        run: ./tidb/mvnw clean install -f core/pom.xml -pl debezium-bom,debezium-connector-common,debezium-util,debezium-config,debezium-embedded,debezium-storage,debezium-connect-plugins,debezium-assembly-descriptors -am -DskipTests -DskipITs -Dformat.formatter.goal=validate -Dformat.imports.goal=check -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
+      - name: Maven build TiDB
+        run: ./tidb/mvnw clean install -f tidb/pom.xml -Passembly -Dformat.formatter.goal=validate -Dformat.imports.goal=check -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -DfailFlakyTests=false -Ddebezium.test.records.waittime=5

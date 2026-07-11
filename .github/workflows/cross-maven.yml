@@ -4,7 +4,7 @@
 # Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
 #
 # Cross CI workflow is triggered on a `pull_request` event.
-# It builds the Debezium core before building the Milvus connector basing on either the `master` branch or the `pull_request` branch.
+# It builds the Debezium core before building the TiDB connector basing on either the `master` branch or the `pull_request` branch.
 # If a `pull_request` with same branch name is present in the Debezium's upstream core repository, then the core build of this `pull_request`
 # will be based on `pull_request` branch of user's Debezium core repository.
 # Otherwise the core build of this `pull_request` will be based on the `master` branch of Debezium's upstream core repository.
@@ -33,10 +33,10 @@ jobs:
     needs: [ check-signed-commits ]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout milvus repository
+      - name: Checkout tidb repository
         uses: actions/checkout@v7
         with:
-          path: milvus
+          path: tidb
       - name: Check if pull request branch exists in debezium main repository
         id: branch
         env:
@@ -76,6 +76,6 @@ jobs:
           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
           restore-keys: ${{ runner.os }}-m2
       - name: Maven build core
-        run: ./milvus/mvnw clean install -f core/pom.xml -pl debezium-bom,debezium-connector-common,debezium-util,debezium-config,debezium-embedded,debezium-storage,debezium-connect-plugins -am -DskipTests -DskipITs -Dformat.formatter.goal=validate -Dformat.imports.goal=check -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
-      - name: Maven build Milvus
-        run: ./milvus/mvnw clean install -f milvus/pom.xml -Passembly -Dformat.formatter.goal=validate -Dformat.imports.goal=check -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -DfailFlakyTests=false -Ddebezium.test.records.waittime=5
+        run: ./tidb/mvnw clean install -f core/pom.xml -pl debezium-bom,debezium-connector-common,debezium-util,debezium-config,debezium-embedded,debezium-storage,debezium-connect-plugins,debezium-assembly-descriptors -am -DskipTests -DskipITs -Dformat.formatter.goal=validate -Dformat.imports.goal=check -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
+      - name: Maven build TiDB
+        run: ./tidb/mvnw clean install -f tidb/pom.xml -Passembly -Dformat.formatter.goal=validate -Dformat.imports.goal=check -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -DfailFlakyTests=false -Ddebezium.test.records.waittime=5
