@@ -84,7 +84,7 @@ Minimal example:
 | `ticdc.initial.offset` | `earliest` | Where to start reading when no offsets are stored (`earliest`/`latest`). |
 | `ticdc.poll.timeout.ms` | `500` | Poll timeout of the internal consumer. |
 | `ticdc.consumer.*` | — | Pass-through properties for the internal Kafka consumer (e.g. security settings). |
-| `snapshot.mode` | `no_data` | `no_data` or `never`; data snapshots are not implemented yet (see roadmap). |
+| `snapshot.mode` | `no_data` | Only `no_data` is supported: no data snapshot is taken and the table structure is learned from the TiCDC messages; data snapshots are not implemented yet (see roadmap). |
 
 All common Debezium options (`table.include.list`, `topic.naming.strategy`, `tombstones.on.delete`,
 SMTs, ...) apply as usual.
