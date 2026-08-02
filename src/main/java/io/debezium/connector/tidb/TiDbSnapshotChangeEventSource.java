@@ -8,12 +8,11 @@ package io.debezium.connector.tidb;
 import java.util.List;
 import java.util.Map;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import io.debezium.pipeline.notification.NotificationService;
 import io.debezium.pipeline.signal.actions.snapshotting.SnapshotConfiguration;
+import io.debezium.pipeline.source.AbstractSnapshotChangeEventSource;
 import io.debezium.pipeline.source.SnapshottingTask;
-import io.debezium.pipeline.source.spi.SnapshotChangeEventSource;
+import io.debezium.pipeline.source.spi.SnapshotProgressListener;
 import io.debezium.pipeline.spi.SnapshotResult;
 
 /**
@@ -26,26 +25,19 @@ import io.debezium.pipeline.spi.SnapshotResult;
  *
  * @author Aviral Srivastava
  */
-public class TiDbSnapshotChangeEventSource implements SnapshotChangeEventSource<TiDbPartition, TiDbOffsetContext> {
+public class TiDbSnapshotChangeEventSource extends AbstractSnapshotChangeEventSource<TiDbPartition, TiDbOffsetContext> {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(TiDbSnapshotChangeEventSource.class);
-
-    private final TiDbConnectorConfig connectorConfig;
-
-    public TiDbSnapshotChangeEventSource(TiDbConnectorConfig connectorConfig) {
-        this.connectorConfig = connectorConfig;
-    }
-
-    @Override
-    public SnapshotResult<TiDbOffsetContext> execute(ChangeEventSourceContext context, TiDbPartition partition,
-                                                     TiDbOffsetContext previousOffset, SnapshottingTask snapshottingTask) {
-        LOGGER.info("Snapshots are not supported by the TiDB connector yet, proceeding to streaming");
-        final TiDbOffsetContext offset = previousOffset != null ? previousOffset : TiDbOffsetContext.empty(connectorConfig);
-        return SnapshotResult.skipped(offset);
+    public TiDbSnapshotChangeEventSource(TiDbConnectorConfig connectorConfig,
+                                         SnapshotProgressListener<TiDbPartition> snapshotProgressListener,
+                                         NotificationService<TiDbPartition, TiDbOffsetContext> notificationService) {
+        super(connectorConfig, snapshotProgressListener, notificationService);
     }
 
     @Override
     public SnapshottingTask getSnapshottingTask(TiDbPartition partition, TiDbOffsetContext previousOffset) {
+        // Neither part of a snapshot applies yet: table structure arrives inline with every
+        // TiCDC message and data snapshots require the SQL endpoint support of a later
+        // iteration, so the snapshot is always skipped
         return new SnapshottingTask(false, false, List.of(), Map.of(), false);
     }
 
@@ -53,5 +45,18 @@ public class TiDbSnapshotChangeEventSource implements SnapshotChangeEventSource<
     public SnapshottingTask getBlockingSnapshottingTask(TiDbPartition partition, TiDbOffsetContext previousOffset,
                                                         SnapshotConfiguration snapshotConfiguration) {
         return new SnapshottingTask(false, false, List.of(), Map.of(), true);
+    }
+
+    @Override
+    protected SnapshotResult<TiDbOffsetContext> doExecute(ChangeEventSourceContext context, TiDbOffsetContext previousOffset,
+                                                          SnapshotContext<TiDbPartition, TiDbOffsetContext> snapshotContext,
+                                                          SnapshottingTask snapshottingTask) {
+        // Not reachable while getSnapshottingTask() skips both snapshot parts
+        return SnapshotResult.skipped(previousOffset);
+    }
+
+    @Override
+    protected SnapshotContext<TiDbPartition, TiDbOffsetContext> prepare(TiDbPartition partition, boolean onDemand) {
+        return new SnapshotContext<>(partition);
     }
 }

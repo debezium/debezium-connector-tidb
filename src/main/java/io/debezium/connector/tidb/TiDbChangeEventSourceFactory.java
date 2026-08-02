@@ -40,7 +40,7 @@ public class TiDbChangeEventSourceFactory implements ChangeEventSourceFactory<Ti
     @Override
     public SnapshotChangeEventSource<TiDbPartition, TiDbOffsetContext> getSnapshotChangeEventSource(SnapshotProgressListener<TiDbPartition> snapshotProgressListener,
                                                                                                     NotificationService<TiDbPartition, TiDbOffsetContext> notificationService) {
-        return new TiDbSnapshotChangeEventSource(connectorConfig);
+        return new TiDbSnapshotChangeEventSource(connectorConfig, snapshotProgressListener, notificationService);
     }
 
     @Override

@@ -55,19 +55,16 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
     /**
      * The set of predefined snapshot mode options. Snapshots of data are not implemented yet for
      * the first iteration of the connector; the TiCDC changefeed itself can backfill historical
-     * data when created with a {@code start-ts} in the past.
+     * data when created with a {@code start-ts} in the past. Only modes with a matching
+     * {@code Snapshotter} SPI implementation in the Debezium framework may be listed here.
      */
     public enum SnapshotMode implements EnumeratedValue {
 
         /**
-         * Capture the structure of relevant tables only, no data, then stream changes from TiCDC.
+         * Take no data snapshot; table structure is learned from the inline schemas of the TiCDC
+         * messages and changes are streamed from the TiCDC topics.
          */
-        NO_DATA("no_data"),
-
-        /**
-         * Never perform a snapshot; stream changes from the TiCDC topics only.
-         */
-        NEVER("never");
+        NO_DATA("no_data");
 
         private final String value;
 
@@ -175,9 +172,9 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
             .withEnum(SnapshotMode.class, SnapshotMode.NO_DATA)
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
-            .withDescription("The criteria for running a snapshot upon startup of the connector. Select one of the following snapshot options: "
-                    + "'no_data': The connector captures the structure of all relevant tables, but no data, and streams changes from the TiCDC topics; "
-                    + "'never': The connector performs no snapshot and immediately streams changes from the TiCDC topics.");
+            .withDescription("The criteria for running a snapshot upon startup of the connector. The only supported option is "
+                    + "'no_data': The connector takes no data snapshot, learns the table structure from the TiCDC messages "
+                    + "and immediately streams changes from the TiCDC topics.");
 
     public static final Field SOURCE_INFO_STRUCT_MAKER = CommonConnectorConfig.SOURCE_INFO_STRUCT_MAKER
             .withDefault(TiDbSourceInfoStructMaker.class.getName());

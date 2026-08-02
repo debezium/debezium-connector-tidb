@@ -27,6 +27,24 @@
         <version.debezium>${project.version}</version.debezium>
     </properties>
 
+    <repositories>
+        <repository>
+            <id>central-snapshots</id>
+            <name>Maven Central Snapshots</name>
+            <!-- Literal URL rather than ${publish.snapshot.url}: the property lives in the parent,
+                 which itself has to be resolvable through this repository -->
+            <url>https://central.sonatype.com/repository/maven-snapshots/</url>
+            <releases>
+                <enabled>true</enabled>
+                <updatePolicy>never</updatePolicy>
+            </releases>
+            <snapshots>
+                <enabled>true</enabled>
+                <updatePolicy>never</updatePolicy>
+            </snapshots>
+        </repository>
+    </repositories>
+
     <dependencyManagement>
         <dependencies>
             <dependency>

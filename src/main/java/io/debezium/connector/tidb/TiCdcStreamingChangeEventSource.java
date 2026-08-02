@@ -16,6 +16,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.InterruptException;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -93,6 +94,12 @@ public class TiCdcStreamingChangeEventSource implements StreamingChangeEventSour
         }
         catch (InterruptedException e) {
             throw e;
+        }
+        catch (InterruptException e) {
+            // KafkaConsumer reports a thread interrupt (forced shutdown after the graceful stop
+            // timeout) through its own unchecked exception; surface it as a regular interruption
+            // rather than a connector failure
+            throw (InterruptedException) new InterruptedException("Interrupted while polling the TiCDC topics").initCause(e);
         }
         catch (Throwable t) {
             errorHandler.setProducerThrowable(t);

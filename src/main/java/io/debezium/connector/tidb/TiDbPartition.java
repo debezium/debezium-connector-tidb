@@ -40,11 +40,10 @@ public class TiDbPartition implements Partition {
         if (this == obj) {
             return true;
         }
-        if (obj == null || getClass() != obj.getClass()) {
-            return false;
+        if (obj instanceof TiDbPartition that) {
+            return Objects.equals(serverName, that.serverName);
         }
-        final TiDbPartition other = (TiDbPartition) obj;
-        return Objects.equals(serverName, other.serverName);
+        return false;
     }
 
     @Override
