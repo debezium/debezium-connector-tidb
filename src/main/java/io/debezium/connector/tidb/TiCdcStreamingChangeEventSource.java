@@ -7,6 +7,7 @@ package io.debezium.connector.tidb;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Properties;
 
 import org.apache.kafka.clients.consumer.Consumer;
@@ -26,6 +27,8 @@ import io.debezium.connector.tidb.ticdc.TiCdcEvent;
 import io.debezium.connector.tidb.ticdc.TiCdcEventParser;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
+import io.debezium.pipeline.monitor.OffsetActivityMonitor;
+import io.debezium.pipeline.monitor.OffsetActivityMonitorService;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
 import io.debezium.relational.TableId;
 import io.debezium.util.Clock;
@@ -56,6 +59,8 @@ public class TiCdcStreamingChangeEventSource implements StreamingChangeEventSour
     private final TiDbSchema schema;
 
     private volatile TiDbOffsetContext effectiveOffsetContext;
+    private final OffsetActivityMonitorService offsetActivityMonitorService;
+    private OffsetActivityMonitor<TiDbPartition, TiDbOffsetContext> offsetActivityMonitor;
 
     public TiCdcStreamingChangeEventSource(TiDbConnectorConfig connectorConfig,
                                            EventDispatcher<TiDbPartition, TableId> dispatcher,
@@ -65,6 +70,7 @@ public class TiCdcStreamingChangeEventSource implements StreamingChangeEventSour
         this.errorHandler = errorHandler;
         this.clock = clock;
         this.schema = schema;
+        this.offsetActivityMonitorService = OffsetActivityMonitorService.lookup(connectorConfig.getServiceRegistry());
     }
 
     @Override
@@ -90,6 +96,8 @@ public class TiCdcStreamingChangeEventSource implements StreamingChangeEventSour
                     }
                     processRecord(parser, partition, effectiveOffset, record);
                 }
+
+                offsetActivityMonitorService.pulse(partition, effectiveOffset);
             }
         }
         catch (InterruptedException e) {
@@ -172,5 +180,13 @@ public class TiCdcStreamingChangeEventSource implements StreamingChangeEventSour
     @Override
     public TiDbOffsetContext getOffsetContext() {
         return effectiveOffsetContext;
+    }
+
+    @Override
+    public Optional<OffsetActivityMonitor<TiDbPartition, TiDbOffsetContext>> getOffsetActivityMonitor() {
+        if (offsetActivityMonitor == null) {
+            offsetActivityMonitor = new TiDbOffsetActivityMonitor(connectorConfig.getOffsetActivityMonitorInterval());
+        }
+        return Optional.of(offsetActivityMonitor);
     }
 }
