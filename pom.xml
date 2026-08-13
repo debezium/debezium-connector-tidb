@@ -9,7 +9,7 @@
 
     <modelVersion>4.0.0</modelVersion>
     <artifactId>debezium-connector-tidb</artifactId>
-    <version>3.7.0.Alpha2</version>
+    <version>3.7.0-SNAPSHOT</version>
     <name>Debezium Connector for TiDB</name>
     <packaging>jar</packaging>
     <description>A Debezium connector consuming the Debezium-format Kafka output of a TiCDC changefeed</description>
@@ -19,7 +19,7 @@
         <connection>scm:git:git@github.com:debezium/debezium-connector-tidb.git</connection>
         <developerConnection>scm:git:git@github.com:debezium/debezium-connector-tidb.git</developerConnection>
         <url>https://github.com/debezium/debezium-connector-tidb</url>
-        <tag>v3.7.0.Alpha2</tag>
+        <tag>HEAD</tag>
     </scm>
 
     <properties>
