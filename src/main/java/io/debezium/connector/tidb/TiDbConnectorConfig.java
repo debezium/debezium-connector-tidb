@@ -20,6 +20,7 @@ import org.apache.kafka.common.config.ConfigDef.Width;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.ConfigDefinition;
 import io.debezium.config.Configuration;
+import io.debezium.config.ConfigurationNames;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
 import io.debezium.connector.AbstractSourceInfo;
@@ -53,9 +54,7 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
             "information_schema", "mysql", "performance_schema", "sys", "metrics_schema", "inspection_schema", "lightning_task_info");
 
     /**
-     * The set of predefined snapshot mode options. Snapshots of data are not implemented yet for
-     * the first iteration of the connector; the TiCDC changefeed itself can backfill historical
-     * data when created with a {@code start-ts} in the past. Only modes with a matching
+     * The set of predefined snapshot mode options. Only modes with a matching
      * {@code Snapshotter} SPI implementation in the Debezium framework may be listed here.
      */
     public enum SnapshotMode implements EnumeratedValue {
@@ -64,7 +63,18 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
          * Take no data snapshot; table structure is learned from the inline schemas of the TiCDC
          * messages and changes are streamed from the TiCDC topics.
          */
-        NO_DATA("no_data");
+        NO_DATA("no_data"),
+
+        /**
+         * Snapshot the data of all captured tables through TiDB's MySQL compatible SQL endpoint
+         * on first startup, then stream changes from the TiCDC topics.
+         */
+        INITIAL("initial"),
+
+        /**
+         * Snapshot the data of all captured tables and stop, without streaming changes.
+         */
+        INITIAL_ONLY("initial_only");
 
         private final String value;
 
@@ -172,9 +182,49 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
             .withEnum(SnapshotMode.class, SnapshotMode.NO_DATA)
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
-            .withDescription("The criteria for running a snapshot upon startup of the connector. The only supported option is "
+            .withDescription("The criteria for running a snapshot upon startup of the connector. Select one of the following snapshot options: "
                     + "'no_data': The connector takes no data snapshot, learns the table structure from the TiCDC messages "
-                    + "and immediately streams changes from the TiCDC topics.");
+                    + "and immediately streams changes from the TiCDC topics; "
+                    + "'initial': On first startup the connector snapshots the data of all captured tables through TiDB's SQL endpoint, "
+                    + "then streams changes from the TiCDC topics; "
+                    + "'initial_only': The connector snapshots the data of all captured tables and stops without streaming changes.");
+
+    public static final Field JDBC_HOSTNAME = Field.create(ConfigurationNames.DATABASE_CONFIG_PREFIX + "hostname")
+            .withDisplayName("TiDB hostname")
+            .withType(Type.STRING)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 3))
+            .withWidth(Width.MEDIUM)
+            .withImportance(Importance.MEDIUM)
+            .withValidation(TiDbConnectorConfig::validateSnapshotConnection)
+            .withDescription("Resolvable hostname or IP address of the TiDB SQL endpoint. "
+                    + "Only required when the snapshot mode captures data.");
+
+    public static final Field JDBC_PORT = Field.create(ConfigurationNames.DATABASE_CONFIG_PREFIX + "port")
+            .withDisplayName("TiDB port")
+            .withType(Type.INT)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 4))
+            .withDefault(4000)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.MEDIUM)
+            .withValidation(Field::isInteger)
+            .withDescription("Port of the TiDB SQL endpoint.");
+
+    public static final Field JDBC_USER = Field.create(ConfigurationNames.DATABASE_CONFIG_PREFIX + "user")
+            .withDisplayName("TiDB user")
+            .withType(Type.STRING)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 5))
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("Name of the database user connecting to the TiDB SQL endpoint. "
+                    + "Only required when the snapshot mode captures data.");
+
+    public static final Field JDBC_PASSWORD = Field.create(ConfigurationNames.DATABASE_CONFIG_PREFIX + "password")
+            .withDisplayName("TiDB password")
+            .withType(Type.PASSWORD)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 6))
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("Password of the database user connecting to the TiDB SQL endpoint.");
 
     public static final Field SOURCE_INFO_STRUCT_MAKER = CommonConnectorConfig.SOURCE_INFO_STRUCT_MAKER
             .withDefault(TiDbSourceInfoStructMaker.class.getName());
@@ -184,14 +234,38 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     private static final ConfigDefinition CONFIG_DEFINITION = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
             .name("TiDB")
-            // The first iteration has no direct connection to TiDB's SQL endpoint; the JDBC
-            // connection options return together with managed snapshot support
+            // The base relational connection fields are required fields; the connector replaces
+            // them with optional variants because the SQL endpoint is only needed when the
+            // snapshot mode captures data
             .excluding(HOSTNAME, PORT, USER, PASSWORD, DATABASE_NAME)
-            .group(Field.Group.CONNECTION, TICDC_BOOTSTRAP_SERVERS, TICDC_TOPICS)
+            .group(Field.Group.CONNECTION, TICDC_BOOTSTRAP_SERVERS, TICDC_TOPICS, JDBC_HOSTNAME, JDBC_PORT, JDBC_USER, JDBC_PASSWORD)
             .group(Field.Group.CONNECTION_ADVANCED, TICDC_POLL_TIMEOUT_MS, TICDC_INITIAL_OFFSET)
             .group(Field.Group.CONNECTOR_SNAPSHOT, SNAPSHOT_MODE)
             .group(Field.Group.CONNECTOR_ADVANCED, SOURCE_INFO_STRUCT_MAKER, TOPIC_NAMING_STRATEGY)
             .create();
+
+    /**
+     * Validates that the SQL endpoint connection is configured when the selected snapshot mode
+     * needs to read data from TiDB.
+     */
+    private static int validateSnapshotConnection(Configuration config, Field field, Field.ValidationOutput problems) {
+        final SnapshotMode mode = SnapshotMode.parse(config.getString(SNAPSHOT_MODE));
+        if (mode == SnapshotMode.NO_DATA || mode == null) {
+            return 0;
+        }
+        int problemCount = 0;
+        if (Strings.isNullOrEmpty(config.getString(JDBC_HOSTNAME))) {
+            problems.accept(JDBC_HOSTNAME, null, "'" + JDBC_HOSTNAME.name() + "' is required when '"
+                    + SNAPSHOT_MODE_PROPERTY_NAME + "' is '" + mode.getValue() + "'");
+            problemCount++;
+        }
+        if (Strings.isNullOrEmpty(config.getString(JDBC_USER))) {
+            problems.accept(JDBC_USER, null, "'" + JDBC_USER.name() + "' is required when '"
+                    + SNAPSHOT_MODE_PROPERTY_NAME + "' is '" + mode.getValue() + "'");
+            problemCount++;
+        }
+        return problemCount;
+    }
 
     /**
      * The set of {@link Field}s defined as part of this configuration.

@@ -257,6 +257,31 @@ public class TiCdcStreamingChangeEventSourceTest {
     }
 
     @Test
+    public void shouldSkipEventsAlreadyCapturedByTheSnapshot() throws InterruptedException {
+        final StreamingHarness harness = new StreamingHarness(config().build());
+
+        // The initial snapshot ran at TSO 200; the changefeed replays history from before it
+        final TiDbOffsetContext storedOffset = new TiDbOffsetContext.Loader(harness.connectorConfig)
+                .load(Map.of(
+                        TiDbOffsetContext.COMMIT_TS_KEY, 200L,
+                        TiDbOffsetContext.SNAPSHOT_TS_KEY, 200L));
+
+        final List<SourceRecord> records = harness.run(storedOffset, List.of(
+                record(0, null, TiCdcTestMessages.createMessage("inventory", "products", 1, "before-snapshot", 150L)),
+                record(1, null, TiCdcTestMessages.createMessage("inventory", "products", 2, "at-snapshot", 200L)),
+                record(2, null, TiCdcTestMessages.createMessage("inventory", "products", 3, "after-snapshot", 250L))));
+
+        assertThat(records).hasSize(1);
+        final Struct value = (Struct) records.get(0).value();
+        assertThat(value.getStruct(Envelope.FieldName.AFTER).getString("name")).isEqualTo("after-snapshot");
+
+        // The skipped messages still advance the stream position
+        @SuppressWarnings("unchecked")
+        final Map<String, Object> sourceOffset = (Map<String, Object>) records.get(0).sourceOffset();
+        assertThat(sourceOffset).containsEntry(TiDbOffsetContext.TICDC_OFFSETS_KEY, TICDC_TOPIC + ":0=3");
+    }
+
+    @Test
     public void shouldEmitDeleteWithTombstone() throws InterruptedException {
         final StreamingHarness harness = new StreamingHarness(config().build());
 

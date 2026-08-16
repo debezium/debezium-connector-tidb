@@ -14,6 +14,8 @@ import java.util.OptionalLong;
 import org.apache.kafka.connect.data.Schema;
 
 import io.debezium.DebeziumException;
+import io.debezium.connector.AbstractSourceInfo;
+import io.debezium.connector.SnapshotType;
 import io.debezium.pipeline.CommonOffsetContext;
 import io.debezium.pipeline.spi.OffsetContext;
 import io.debezium.pipeline.txmetadata.TransactionContext;
@@ -41,6 +43,7 @@ public class TiDbOffsetContext extends CommonOffsetContext<SourceInfo> {
 
     public static final String COMMIT_TS_KEY = SourceInfo.COMMIT_TS_KEY;
     public static final String TICDC_OFFSETS_KEY = "ticdc_offsets";
+    public static final String SNAPSHOT_TS_KEY = "snapshot_ts";
 
     private static final String PARTITION_SEPARATOR = ",";
     private static final String OFFSET_SEPARATOR = "=";
@@ -53,6 +56,12 @@ public class TiDbOffsetContext extends CommonOffsetContext<SourceInfo> {
     private final Map<String, Long> ticdcOffsets = new LinkedHashMap<>();
 
     private long commitTs;
+
+    /**
+     * The TSO at which the initial snapshot was taken, 0 when no snapshot ran. Streamed events
+     * with a commit timestamp not newer than this are dropped as already captured.
+     */
+    private long snapshotTs;
 
     public TiDbOffsetContext(SourceInfo sourceInfo, TransactionContext transactionContext) {
         super(sourceInfo);
@@ -67,9 +76,17 @@ public class TiDbOffsetContext extends CommonOffsetContext<SourceInfo> {
     public Map<String, ?> getOffset() {
         final Map<String, Object> offset = new HashMap<>();
         offset.put(COMMIT_TS_KEY, commitTs);
+        if (snapshotTs > 0) {
+            offset.put(SNAPSHOT_TS_KEY, snapshotTs);
+        }
         if (!ticdcOffsets.isEmpty()) {
             offset.put(TICDC_OFFSETS_KEY, Strings.join(PARTITION_SEPARATOR, ticdcOffsets.entrySet(),
                     e -> e.getKey() + OFFSET_SEPARATOR + e.getValue()));
+        }
+        if (getSnapshot().isPresent()) {
+            offset.put(AbstractSourceInfo.SNAPSHOT_KEY, getSnapshot().get().toString());
+            offset.put(SNAPSHOT_COMPLETED_KEY, snapshotCompleted);
+            return offset;
         }
         return transactionContext.store(offset);
     }
@@ -111,6 +128,28 @@ public class TiDbOffsetContext extends CommonOffsetContext<SourceInfo> {
         return commitTs;
     }
 
+    public long getSnapshotTs() {
+        return snapshotTs;
+    }
+
+    /**
+     * Marks the start of the initial snapshot taken at the given TSO.
+     */
+    public void snapshotStarted(long tso, boolean onDemand) {
+        preSnapshotStart(onDemand);
+        this.snapshotTs = tso;
+        this.commitTs = tso;
+    }
+
+    /**
+     * Records the position of a snapshotted row: the logical position is the snapshot TSO, there
+     * is no TiCDC stream position during a snapshot.
+     */
+    public void snapshotEvent(TableId tableId, Instant timestamp, long tso) {
+        this.commitTs = tso;
+        sourceInfo.update(tableId, timestamp, tso, null);
+    }
+
     /**
      * @return the next offset to consume for the given TiCDC topic-partition, if one was recorded
      */
@@ -139,6 +178,17 @@ public class TiDbOffsetContext extends CommonOffsetContext<SourceInfo> {
             final Object commitTs = offset.get(COMMIT_TS_KEY);
             if (commitTs instanceof Number number) {
                 context.commitTs = number.longValue();
+            }
+
+            final Object snapshotTs = offset.get(SNAPSHOT_TS_KEY);
+            if (snapshotTs instanceof Number number) {
+                context.snapshotTs = number.longValue();
+            }
+
+            if (offset.get(AbstractSourceInfo.SNAPSHOT_KEY) instanceof String snapshotType) {
+                context.setSnapshot(SnapshotType.valueOf(snapshotType));
+                context.snapshotCompleted = Boolean.TRUE.equals(offset.get(SNAPSHOT_COMPLETED_KEY))
+                        || "true".equals(offset.get(SNAPSHOT_COMPLETED_KEY));
             }
 
             final Object encodedOffsets = offset.get(TICDC_OFFSETS_KEY);
