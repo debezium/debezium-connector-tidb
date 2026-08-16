@@ -68,6 +68,30 @@ public class TiDbConnectorConfigTest {
     }
 
     @Test
+    public void shouldNotValidateDataSnapshotModeWithoutSqlEndpoint() {
+        final Configuration config = minimalConfig()
+                .with(TiDbConnectorConfig.SNAPSHOT_MODE, "initial")
+                .build();
+        assertThat(config.validateAndRecord(TiDbConnectorConfig.ALL_FIELDS, error -> {
+        })).isFalse();
+    }
+
+    @Test
+    public void shouldValidateDataSnapshotModeWithSqlEndpoint() {
+        final Configuration config = minimalConfig()
+                .with(TiDbConnectorConfig.SNAPSHOT_MODE, "initial")
+                .with(TiDbConnectorConfig.JDBC_HOSTNAME, "localhost")
+                .with(TiDbConnectorConfig.JDBC_USER, "root")
+                .build();
+        assertThat(config.validateAndRecord(TiDbConnectorConfig.ALL_FIELDS, error -> {
+        })).isTrue();
+
+        final TiDbConnectorConfig connectorConfig = new TiDbConnectorConfig(config);
+        assertThat(connectorConfig.getSnapshotMode()).isEqualTo(TiDbConnectorConfig.SnapshotMode.INITIAL);
+        assertThat(config.getInteger(TiDbConnectorConfig.JDBC_PORT)).isEqualTo(4000);
+    }
+
+    @Test
     public void shouldPassThroughConsumerProperties() {
         final TiDbConnectorConfig config = new TiDbConnectorConfig(
                 minimalConfig()
