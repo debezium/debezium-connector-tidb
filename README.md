@@ -81,6 +81,12 @@ The snapshot session must stay within the GC lifetime of the cluster (`tidb_gc_l
 rejects `tidb_snapshot` reads older than the GC safe point, so very long snapshots need a longer
 GC lifetime for their duration.
 
+Encryption of the snapshot connection follows the MySQL driver default: TLS is negotiated when
+the server supports it. Additional driver settings can be passed through with the `database.`
+prefix, for example `database.sslMode=VERIFY_CA` to require a verified TLS connection. The
+snapshot session runs with its time zone pinned to UTC so that TIMESTAMP values are read
+consistently regardless of the cluster's global time zone.
+
 ## Configuration
 
 Minimal example:

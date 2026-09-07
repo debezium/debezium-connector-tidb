@@ -8,6 +8,7 @@ package io.debezium.connector.tidb;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.math.BigDecimal;
+import java.sql.Types;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +33,8 @@ import io.debezium.pipeline.source.SnapshottingTask;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
 import io.debezium.pipeline.source.spi.SnapshotProgressListener;
 import io.debezium.pipeline.spi.SnapshotResult;
+import io.debezium.relational.Column;
+import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables.TableFilter;
 import io.debezium.schema.SchemaFactory;
@@ -54,10 +57,13 @@ public class TiDbSnapshotChangeEventSourceTest {
     private static final long TSO = 446245805252059200L;
     private static final TableId PRODUCTS = new TableId("inventory", null, "products");
 
-    private static final List<TiDbColumn> PRODUCT_COLUMNS = List.of(
-            new TiDbColumn("id", "bigint", "bigint", true),
-            new TiDbColumn("name", "varchar", "varchar(255)", false),
-            new TiDbColumn("weight", "decimal", "decimal(10,2)", false));
+    private static final Table PRODUCTS_TABLE = Table.editor()
+            .tableId(PRODUCTS)
+            .addColumn(Column.editor().name("id").type("bigint").jdbcType(Types.BIGINT).optional(false).position(1).create())
+            .addColumn(Column.editor().name("name").type("varchar(255)").jdbcType(Types.VARCHAR).optional(true).position(2).create())
+            .addColumn(Column.editor().name("weight").type("decimal(10,2)").jdbcType(Types.DECIMAL).optional(true).position(3).create())
+            .setPrimaryKeyNames(List.of("id"))
+            .create();
 
     private static final List<Object[]> PRODUCT_ROWS = List.of(
             new Object[]{ 17L, "scooter", new BigDecimal("3.14") },
@@ -133,7 +139,7 @@ public class TiDbSnapshotChangeEventSourceTest {
         }
 
         @Override
-        public void setSnapshotTso(long tso) {
+        public void initSnapshotSession(long tso) {
             assertThat(tso).isEqualTo(TSO);
         }
 
@@ -143,12 +149,12 @@ public class TiDbSnapshotChangeEventSourceTest {
         }
 
         @Override
-        public List<TiDbColumn> readColumns(TableId tableId) {
-            return PRODUCT_COLUMNS;
+        public Table readTableStructure(TableId tableId) {
+            return PRODUCTS_TABLE;
         }
 
         @Override
-        public void fetchRows(String snapshotQuery, List<TiDbColumn> columns, RowConsumer consumer) throws InterruptedException {
+        public void fetchRows(String snapshotQuery, List<Column> columns, RowConsumer consumer) throws InterruptedException {
             assertThat(snapshotQuery).isEqualTo("SELECT `id`, `name`, `weight` FROM `inventory`.`products`");
             for (Object[] row : PRODUCT_ROWS) {
                 consumer.accept(row);

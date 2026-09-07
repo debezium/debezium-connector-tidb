@@ -9,7 +9,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,7 +23,14 @@ import io.debezium.pipeline.source.AbstractSnapshotChangeEventSource;
 import io.debezium.pipeline.source.SnapshottingTask;
 import io.debezium.pipeline.source.spi.SnapshotProgressListener;
 import io.debezium.pipeline.spi.SnapshotResult;
+import io.debezium.relational.Column;
+import io.debezium.relational.CustomConverterRegistry;
+import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
+import io.debezium.relational.TableSchema;
+import io.debezium.relational.TableSchemaBuilder;
+import io.debezium.relational.mapping.ColumnMappers;
+import io.debezium.schema.SchemaFactory;
 import io.debezium.snapshot.SnapshotterService;
 import io.debezium.spi.topic.TopicNamingStrategy;
 import io.debezium.util.Clock;
@@ -53,7 +59,7 @@ public class TiDbSnapshotChangeEventSource extends AbstractSnapshotChangeEventSo
     private final Clock clock;
     private final TiDbSchema schema;
     private final TopicNamingStrategy<TableId> topicNamingStrategy;
-    private final TiDbSnapshotSchemaBuilder schemaBuilder;
+    private final TableSchemaBuilder tableSchemaBuilder;
 
     public TiDbSnapshotChangeEventSource(TiDbConnectorConfig connectorConfig,
                                          SnapshotterService snapshotterService,
@@ -70,7 +76,15 @@ public class TiDbSnapshotChangeEventSource extends AbstractSnapshotChangeEventSo
         this.clock = clock;
         this.schema = schema;
         this.topicNamingStrategy = topicNamingStrategy;
-        this.schemaBuilder = new TiDbSnapshotSchemaBuilder(connectorConfig.schemaNameAdjuster());
+        this.tableSchemaBuilder = new TableSchemaBuilder(
+                new TiDbJdbcValueConverters(),
+                connectorConfig.schemaNameAdjuster(),
+                new CustomConverterRegistry(List.of()),
+                connectorConfig.getSourceInfoStructMaker().schema(),
+                SchemaFactory.get().transactionBlockSchema(),
+                connectorConfig.getFieldNamer(),
+                false,
+                connectorConfig.getEventConvertingFailureHandlingMode());
     }
 
     @Override
@@ -102,7 +116,7 @@ public class TiDbSnapshotChangeEventSource extends AbstractSnapshotChangeEventSo
             final List<TableId> tables = connection.capturedTables(connectorConfig.getTableFilters().dataCollectionFilter());
             LOGGER.info("Snapshotting {} table(s) at TSO {}", tables.size(), tso);
 
-            connection.setSnapshotTso(tso);
+            connection.initSnapshotSession(tso);
             offset.snapshotStarted(tso, snapshottingTask.isOnDemand());
 
             final SnapshotReceiver<TiDbPartition> receiver = dispatcher.getSnapshotChangeEventReceiver();
@@ -117,6 +131,10 @@ public class TiDbSnapshotChangeEventSource extends AbstractSnapshotChangeEventSo
             offset.preSnapshotCompletion();
             receiver.completeSnapshot();
             offset.postSnapshotCompletion();
+            postSnapshot();
+            // The heartbeat persists the completed snapshot state even when nothing streams
+            // afterwards, e.g. with snapshot.mode=initial_only
+            dispatcher.alwaysDispatchHeartbeatEvent(snapshotContext.partition, offset);
             LOGGER.info("Snapshot of {} table(s) with {} row(s) completed at TSO {}", tables.size(), totalRows, tso);
         }
         return SnapshotResult.completed(offset);
@@ -126,36 +144,37 @@ public class TiDbSnapshotChangeEventSource extends AbstractSnapshotChangeEventSo
                                SnapshotReceiver<TiDbPartition> receiver, TiDbConnection connection, TableId tableId,
                                long tso, boolean lastTable)
             throws Exception {
-        final List<TiDbColumn> columns = connection.readColumns(tableId);
-        final String topicName = topicNamingStrategy.dataChangeTopic(tableId);
-        final Schema keySchema = schemaBuilder.keySchema(topicName, columns);
-        final Schema rowSchema = schemaBuilder.rowSchema(topicName, columns);
-        final TiDbTableSchema tableSchema = schema.refresh(tableId, keySchema, rowSchema);
+        final Table table = connection.readTableStructure(tableId);
+        final TableSchema tableSchema = tableSchemaBuilder.create(topicNamingStrategy, table,
+                connectorConfig.getColumnFilter(), ColumnMappers.create(connectorConfig), connectorConfig.getKeyMapper());
+        final TiDbTableSchema registeredSchema = schema.refresh(tableId, tableSchema.keySchema(), tableSchema.valueSchema());
 
+        final List<Column> columns = table.columns();
         final String query = snapshotterService.getSnapshotQuery()
                 .snapshotQuery(quoted(tableId), columns.stream().map(c -> "`" + c.name() + "`").collect(Collectors.toList()))
                 .orElseThrow(() -> new DebeziumException("No snapshot query for table " + tableId));
         LOGGER.info("Snapshotting table {}", tableId);
 
-        final TiDbOffsetContext offset = snapshotContext.offset;
         final long[] rows = { 0 };
         // Rows are emitted one behind the cursor so that the last row of the last table can be
         // marked as the final snapshot record
         final Struct[] pendingKey = new Struct[1];
         final Struct[] pendingRow = new Struct[1];
+        final boolean[] hasPending = { false };
         connection.fetchRows(query, columns, values -> {
             if (!context.isRunning()) {
                 throw new InterruptedException("Interrupted while snapshotting table " + tableId);
             }
-            if (pendingRow[0] != null) {
-                emitRow(snapshotContext, receiver, tableId, tableSchema, tso, pendingKey[0], pendingRow[0], SnapshotRecord.TRUE);
+            if (hasPending[0]) {
+                emitRow(snapshotContext, receiver, tableId, registeredSchema, tso, pendingKey[0], pendingRow[0], SnapshotRecord.TRUE);
             }
-            pendingKey[0] = schemaBuilder.keyValue(keySchema, columns, values);
-            pendingRow[0] = schemaBuilder.rowValue(rowSchema, columns, values);
+            pendingKey[0] = tableSchema.keyFromColumnData(values);
+            pendingRow[0] = tableSchema.valueFromColumnData(values);
+            hasPending[0] = true;
             rows[0]++;
         });
-        if (pendingRow[0] != null) {
-            emitRow(snapshotContext, receiver, tableId, tableSchema, tso, pendingKey[0], pendingRow[0],
+        if (hasPending[0]) {
+            emitRow(snapshotContext, receiver, tableId, registeredSchema, tso, pendingKey[0], pendingRow[0],
                     lastTable ? SnapshotRecord.LAST : SnapshotRecord.LAST_IN_DATA_COLLECTION);
         }
         return rows[0];
@@ -182,6 +201,13 @@ public class TiDbSnapshotChangeEventSource extends AbstractSnapshotChangeEventSo
      */
     protected TiDbConnection createConnection() {
         return new TiDbConnection(connectorConfig);
+    }
+
+    /**
+     * Hook invoked after the snapshot completed, mirroring
+     * {@code RelationalSnapshotChangeEventSource}.
+     */
+    protected void postSnapshot() throws InterruptedException {
     }
 
     @Override

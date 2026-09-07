@@ -26,7 +26,9 @@
         <!-- Debezium parent -->
         <version.debezium>${project.version}</version.debezium>
 
-        <version.mysql.driver>9.4.0</version.mysql.driver>
+        <!-- Candidate for central maintenance in debezium-parent, like the other driver versions;
+             the tidb specifier allows divergence from the standard MySQL driver if needed -->
+        <version.tidb.driver>9.4.0</version.tidb.driver>
     </properties>
 
     <repositories>
@@ -107,7 +109,7 @@
         <dependency>
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>
-            <version>${version.mysql.driver}</version>
+            <version>${version.tidb.driver}</version>
         </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>
