@@ -7,12 +7,17 @@ package io.debezium.connector.tidb;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
 
 import io.debezium.DebeziumException;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
+import io.debezium.relational.Column;
+import io.debezium.relational.ColumnEditor;
+import io.debezium.relational.Table;
+import io.debezium.relational.TableEditor;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables.TableFilter;
 
@@ -23,12 +28,16 @@ import io.debezium.relational.Tables.TableFilter;
  * TSO timestamp, every query in the session reads the data as of that TSO, so all tables are
  * captured at one consistent point without any locking. The TSO must stay newer than the GC safe
  * point of the cluster for the duration of the snapshot.
+ * <p>
+ * Encryption of the connection follows the driver default (TLS is negotiated when the server
+ * supports it); any {@code database.*} property beyond the standard connection settings is passed
+ * through to the driver, e.g. {@code database.sslMode=VERIFY_CA}.
  *
  * @author Aviral Srivastava
  */
 public class TiDbConnection extends JdbcConnection {
 
-    private static final String URL_PATTERN = "jdbc:mysql://${hostname}:${port}/?useSSL=false&connectTimeout=${connectTimeout}"
+    private static final String URL_PATTERN = "jdbc:mysql://${hostname}:${port}/?connectTimeout=${connectTimeout}"
             + "&zeroDateTimeBehavior=CONVERT_TO_NULL&tinyInt1isBit=false";
 
     private static final String QUOTE = "`";
@@ -60,10 +69,11 @@ public class TiDbConnection extends JdbcConnection {
     }
 
     /**
-     * Pins the session to the given TSO; every following query reads the data as of that point.
+     * Prepares the session for the snapshot: pins the time zone to UTC so that TIMESTAMP values
+     * are returned as UTC wall time, and pins the reads to the given TSO.
      */
-    public void setSnapshotTso(long tso) throws SQLException {
-        execute("SET SESSION tidb_snapshot = '" + tso + "'");
+    public void initSnapshotSession(long tso) throws SQLException {
+        execute("SET time_zone = '+00:00'", "SET SESSION tidb_snapshot = '" + tso + "'");
     }
 
     /**
@@ -85,36 +95,46 @@ public class TiDbConnection extends JdbcConnection {
     }
 
     /**
-     * @return the columns of the given table in ordinal order
+     * @return the relational model of the given table, read from {@code information_schema}
      */
-    public List<TiDbColumn> readColumns(TableId tableId) throws SQLException {
-        final List<TiDbColumn> columns = new ArrayList<>();
-        prepareQuery("SELECT column_name, data_type, column_type, column_key FROM information_schema.columns"
-                + " WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
+    public Table readTableStructure(TableId tableId) throws SQLException {
+        final TableEditor editor = Table.editor().tableId(tableId);
+        final List<String> primaryKeyNames = new ArrayList<>();
+        prepareQuery("SELECT column_name, data_type, column_type, column_key, is_nullable"
+                + " FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
                 statement -> {
                     statement.setString(1, tableId.catalog());
                     statement.setString(2, tableId.table());
                 },
                 rs -> {
+                    int position = 1;
                     while (rs.next()) {
-                        columns.add(new TiDbColumn(
-                                rs.getString(1),
-                                rs.getString(2).toLowerCase(),
-                                rs.getString(3).toLowerCase(),
-                                "PRI".equalsIgnoreCase(rs.getString(4))));
+                        final String name = rs.getString(1);
+                        final String dataType = rs.getString(2).toLowerCase();
+                        final ColumnEditor column = Column.editor()
+                                .name(name)
+                                .type(rs.getString(3).toLowerCase())
+                                .jdbcType(jdbcTypeFor(dataType))
+                                .optional("YES".equalsIgnoreCase(rs.getString(5)))
+                                .position(position++);
+                        editor.addColumn(column.create());
+                        if ("PRI".equalsIgnoreCase(rs.getString(4))) {
+                            primaryKeyNames.add(name);
+                        }
                     }
                 });
-        if (columns.isEmpty()) {
+        if (editor.columns().isEmpty()) {
             throw new DebeziumException("Table " + tableId + " has no columns in information_schema, it may have been dropped");
         }
-        return columns;
+        editor.setPrimaryKeyNames(primaryKeyNames);
+        return editor.create();
     }
 
     /**
      * Runs the given snapshot query and hands every row to the consumer as an array of raw JDBC
      * values in column order.
      */
-    public void fetchRows(String snapshotQuery, List<TiDbColumn> columns, RowConsumer consumer) throws SQLException, InterruptedException {
+    public void fetchRows(String snapshotQuery, List<Column> columns, RowConsumer consumer) throws SQLException, InterruptedException {
         try {
             query(snapshotQuery, rs -> {
                 try {
@@ -140,8 +160,8 @@ public class TiDbConnection extends JdbcConnection {
         }
     }
 
-    private Object readColumnValue(ResultSet rs, int index, TiDbColumn column) throws SQLException {
-        switch (column.dataType()) {
+    private Object readColumnValue(ResultSet rs, int index, Column column) throws SQLException {
+        switch (TiDbJdbcValueConverters.baseType(column)) {
             case "date":
                 // Read as LocalDate to avoid time zone shifts of java.sql.Date
                 return rs.getObject(index, java.time.LocalDate.class);
@@ -152,6 +172,59 @@ public class TiDbConnection extends JdbcConnection {
                 return rs.getString(index);
             default:
                 return rs.getObject(index);
+        }
+    }
+
+    private static int jdbcTypeFor(String dataType) {
+        switch (dataType) {
+            case "tinyint":
+                return Types.TINYINT;
+            case "smallint":
+                return Types.SMALLINT;
+            case "mediumint":
+            case "int":
+            case "year":
+                return Types.INTEGER;
+            case "bigint":
+                return Types.BIGINT;
+            case "float":
+                return Types.REAL;
+            case "double":
+                return Types.DOUBLE;
+            case "decimal":
+                return Types.DECIMAL;
+            case "char":
+            case "enum":
+            case "set":
+                return Types.CHAR;
+            case "varchar":
+                return Types.VARCHAR;
+            case "tinytext":
+            case "text":
+            case "mediumtext":
+            case "longtext":
+            case "json":
+                return Types.LONGVARCHAR;
+            case "binary":
+                return Types.BINARY;
+            case "varbinary":
+                return Types.VARBINARY;
+            case "tinyblob":
+            case "blob":
+            case "mediumblob":
+            case "longblob":
+                return Types.BLOB;
+            case "date":
+                return Types.DATE;
+            case "datetime":
+            case "timestamp":
+                return Types.TIMESTAMP;
+            case "time":
+                return Types.TIME;
+            case "bit":
+                return Types.BIT;
+            default:
+                return Types.OTHER;
         }
     }
 
