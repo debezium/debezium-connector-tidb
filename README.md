@@ -64,6 +64,29 @@ Schemas are learned from the typed TiCDC messages (the changefeed must produce J
 schemas, which is the default for `protocol=debezium`) and refreshed automatically when the
 advertised row schema changes.
 
+## Initial snapshots
+
+With `snapshot.mode=initial` the connector captures the existing data of all captured tables
+through TiDB's MySQL compatible SQL endpoint before streaming starts. The snapshot reads the
+current TSO once, pins the session to it with `tidb_snapshot`, and reads every table at that one
+consistent point. No locks are taken.
+
+The snapshot TSO is recorded in the offsets. During streaming the connector drops any event whose
+`commit_ts` is not newer than the snapshot TSO, so a changefeed whose `start-ts` lies at or
+before the snapshot TSO hands off to streaming without duplicates. Create the changefeed with a
+`start-ts` at or before the snapshot TSO so no change is missed; a changefeed created after the
+snapshot with a later `start-ts` leaves a gap between the snapshot TSO and the `start-ts`.
+
+The snapshot session must stay within the GC lifetime of the cluster (`tidb_gc_life_time`): TiDB
+rejects `tidb_snapshot` reads older than the GC safe point, so very long snapshots need a longer
+GC lifetime for their duration.
+
+Encryption of the snapshot connection follows the MySQL driver default: TLS is negotiated when
+the server supports it. Additional driver settings can be passed through with the `database.`
+prefix, for example `database.sslMode=VERIFY_CA` to require a verified TLS connection. The
+snapshot session runs with its time zone pinned to UTC so that TIMESTAMP values are read
+consistently regardless of the cluster's global time zone.
+
 ## Configuration
 
 Minimal example:
@@ -84,7 +107,11 @@ Minimal example:
 | `ticdc.initial.offset` | `earliest` | Where to start reading when no offsets are stored (`earliest`/`latest`). |
 | `ticdc.poll.timeout.ms` | `500` | Poll timeout of the internal consumer. |
 | `ticdc.consumer.*` | — | Pass-through properties for the internal Kafka consumer (e.g. security settings). |
-| `snapshot.mode` | `no_data` | Only `no_data` is supported: no data snapshot is taken and the table structure is learned from the TiCDC messages; data snapshots are not implemented yet (see roadmap). |
+| `snapshot.mode` | `no_data` | `no_data` (no data snapshot, structure learned from the TiCDC messages), `initial` (snapshot all captured tables through the SQL endpoint on first start, then stream) or `initial_only` (snapshot and stop). |
+| `database.hostname` | — | Hostname of the TiDB SQL endpoint. Required for `initial` and `initial_only`. |
+| `database.port` | `4000` | Port of the TiDB SQL endpoint. |
+| `database.user` | — | User for the TiDB SQL endpoint. Required for `initial` and `initial_only`. |
+| `database.password` | — | Password for the TiDB SQL endpoint. |
 
 All common Debezium options (`table.include.list`, `topic.naming.strategy`, `tombstones.on.delete`,
 SMTs, ...) apply as usual.
@@ -95,15 +122,16 @@ Per the maintainer guidance in DBZ-6269:
 
 1. **(this module)** Connector consuming TiCDC's Debezium-format Kafka output with Debezium
    lifecycle management.
-2. **Managed snapshots** — initial and incremental snapshots through TiDB's MySQL-compatible SQL
-   endpoint (`database.*` options), aligned with the relational connector framework.
+2. **Managed snapshots** — initial snapshots are implemented (`snapshot.mode=initial`);
+   incremental snapshots through the signal mechanism follow.
 3. **Direct TiKV streaming** — replace the TiCDC/Kafka dependency with a client of TiKV's
    `EventFeed` gRPC API; the rest of the connector (offsets keyed by `commit_ts`, envelope,
    snapshots) remains unchanged.
 
 ## Known limitations
 
-* Data snapshots are skipped; use a TiCDC changefeed `start-ts` to backfill history.
+* Incremental snapshots are not implemented yet; an initial snapshot is all or nothing and
+  restarts from the beginning when interrupted.
 * The TiCDC changefeed must emit JSON with inline schemas (`protocol=debezium` default).
 * Decimal values arrive as `float64` from TiCDC's Debezium output; precise decimal encoding
   requires phase 2/3.

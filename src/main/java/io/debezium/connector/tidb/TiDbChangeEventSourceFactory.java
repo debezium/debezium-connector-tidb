@@ -13,6 +13,8 @@ import io.debezium.pipeline.source.spi.SnapshotChangeEventSource;
 import io.debezium.pipeline.source.spi.SnapshotProgressListener;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
 import io.debezium.relational.TableId;
+import io.debezium.snapshot.SnapshotterService;
+import io.debezium.spi.topic.TopicNamingStrategy;
 import io.debezium.util.Clock;
 
 /**
@@ -27,20 +29,26 @@ public class TiDbChangeEventSourceFactory implements ChangeEventSourceFactory<Ti
     private final EventDispatcher<TiDbPartition, TableId> dispatcher;
     private final Clock clock;
     private final TiDbSchema schema;
+    private final TopicNamingStrategy<TableId> topicNamingStrategy;
+    private final SnapshotterService snapshotterService;
 
     public TiDbChangeEventSourceFactory(TiDbConnectorConfig connectorConfig, ErrorHandler errorHandler,
-                                        EventDispatcher<TiDbPartition, TableId> dispatcher, Clock clock, TiDbSchema schema) {
+                                        EventDispatcher<TiDbPartition, TableId> dispatcher, Clock clock, TiDbSchema schema,
+                                        TopicNamingStrategy<TableId> topicNamingStrategy, SnapshotterService snapshotterService) {
         this.connectorConfig = connectorConfig;
         this.errorHandler = errorHandler;
         this.dispatcher = dispatcher;
         this.clock = clock;
         this.schema = schema;
+        this.topicNamingStrategy = topicNamingStrategy;
+        this.snapshotterService = snapshotterService;
     }
 
     @Override
     public SnapshotChangeEventSource<TiDbPartition, TiDbOffsetContext> getSnapshotChangeEventSource(SnapshotProgressListener<TiDbPartition> snapshotProgressListener,
                                                                                                     NotificationService<TiDbPartition, TiDbOffsetContext> notificationService) {
-        return new TiDbSnapshotChangeEventSource(connectorConfig, snapshotProgressListener, notificationService);
+        return new TiDbSnapshotChangeEventSource(connectorConfig, snapshotterService, dispatcher, clock, schema,
+                topicNamingStrategy, snapshotProgressListener, notificationService);
     }
 
     @Override
