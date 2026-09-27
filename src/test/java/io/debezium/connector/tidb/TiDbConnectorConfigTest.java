@@ -68,6 +68,23 @@ public class TiDbConnectorConfigTest {
     }
 
     @Test
+    public void shouldNotValidateExplicitlyEmptyOrUnknownSnapshotMode() {
+        assertThat(minimalConfig().with(TiDbConnectorConfig.SNAPSHOT_MODE, "")
+                .build().validateAndRecord(TiDbConnectorConfig.ALL_FIELDS, error -> {
+                })).isFalse();
+        assertThat(minimalConfig().with(TiDbConnectorConfig.SNAPSHOT_MODE, "always")
+                .build().validateAndRecord(TiDbConnectorConfig.ALL_FIELDS, error -> {
+                })).isFalse();
+    }
+
+    @Test
+    public void shouldNotValidateUnknownInitialOffset() {
+        assertThat(minimalConfig().with(TiDbConnectorConfig.TICDC_INITIAL_OFFSET, "somewhere")
+                .build().validateAndRecord(TiDbConnectorConfig.ALL_FIELDS, error -> {
+                })).isFalse();
+    }
+
+    @Test
     public void shouldNotValidateDataSnapshotModeWithoutSqlEndpoint() {
         final Configuration config = minimalConfig()
                 .with(TiDbConnectorConfig.SNAPSHOT_MODE, "initial")

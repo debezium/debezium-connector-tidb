@@ -90,7 +90,7 @@ public class TiDbSnapshotChangeEventSource extends AbstractSnapshotChangeEventSo
     @Override
     public SnapshottingTask getSnapshottingTask(TiDbPartition partition, TiDbOffsetContext previousOffset) {
         final boolean offsetExists = previousOffset != null;
-        final boolean snapshotInProgress = previousOffset != null && previousOffset.isInitialSnapshotRunning();
+        final boolean snapshotInProgress = offsetExists && previousOffset.isInitialSnapshotRunning();
         // Table structure is never snapshotted separately: the row schemas travel with the data,
         // both in snapshot events and in the TiCDC messages
         final boolean snapshotData = snapshotterService.getSnapshotter().shouldSnapshotData(offsetExists, snapshotInProgress);
@@ -151,7 +151,7 @@ public class TiDbSnapshotChangeEventSource extends AbstractSnapshotChangeEventSo
 
         final List<Column> columns = table.columns();
         final String query = snapshotterService.getSnapshotQuery()
-                .snapshotQuery(quoted(tableId), columns.stream().map(c -> "`" + c.name() + "`").collect(Collectors.toList()))
+                .snapshotQuery(tableId.toQuotedString('`'), columns.stream().map(c -> connection.quoteIdentifier(c.name())).collect(Collectors.toList()))
                 .orElseThrow(() -> new DebeziumException("No snapshot query for table " + tableId));
         LOGGER.info("Snapshotting table {}", tableId);
 
@@ -189,10 +189,6 @@ public class TiDbSnapshotChangeEventSource extends AbstractSnapshotChangeEventSo
         dispatcher.dispatchSnapshotEvent(snapshotContext.partition, tableId,
                 new TiDbSnapshotChangeRecordEmitter(snapshotContext.partition, offset, clock, connectorConfig, key, row),
                 receiver);
-    }
-
-    private static String quoted(TableId tableId) {
-        return "`" + tableId.catalog() + "`.`" + tableId.table() + "`";
     }
 
     /**
