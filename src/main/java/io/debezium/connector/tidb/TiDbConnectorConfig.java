@@ -6,11 +6,13 @@
 package io.debezium.connector.tidb;
 
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Importance;
@@ -172,6 +174,7 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
             .withEnum(InitialOffset.class, InitialOffset.EARLIEST)
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
+            .withValidation(TiDbConnectorConfig::validateInitialOffset)
             .withDescription("The position in the TiCDC topics to start reading from when no offsets have been stored yet: "
                     + "'earliest' to read the topics from the beginning, 'latest' to read only changes arriving after the connector start.");
 
@@ -206,7 +209,7 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
             .withDefault(4000)
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
-            .withValidation(Field::isInteger)
+            .withValidation(Field::isPositiveInteger)
             .withDescription("Port of the TiDB SQL endpoint.");
 
     public static final Field JDBC_USER = Field.create(ConfigurationNames.DATABASE_CONFIG_PREFIX + "user")
@@ -249,8 +252,16 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
      * needs to read data from TiDB.
      */
     private static int validateSnapshotConnection(Configuration config, Field field, Field.ValidationOutput problems) {
-        final SnapshotMode mode = SnapshotMode.parse(config.getString(SNAPSHOT_MODE));
-        if (mode == SnapshotMode.NO_DATA || mode == null) {
+        final String modeValue = config.getString(SNAPSHOT_MODE);
+        final SnapshotMode mode = SnapshotMode.parse(modeValue);
+        if (mode == null) {
+            // getString applies the field default when the key is absent, so a failed parse
+            // means an explicitly supplied empty or unknown value
+            problems.accept(SNAPSHOT_MODE, modeValue, "'" + SNAPSHOT_MODE_PROPERTY_NAME + "' must be one of "
+                    + allowedValues(SnapshotMode.values()));
+            return 1;
+        }
+        if (mode == SnapshotMode.NO_DATA) {
             return 0;
         }
         int problemCount = 0;
@@ -265,6 +276,24 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
             problemCount++;
         }
         return problemCount;
+    }
+
+    /**
+     * Validates that an explicitly supplied initial offset is one of the known values.
+     */
+    private static int validateInitialOffset(Configuration config, Field field, Field.ValidationOutput problems) {
+        final String value = config.getString(field);
+        if (InitialOffset.parse(value) == null) {
+            problems.accept(field, value, "'" + field.name() + "' must be one of " + allowedValues(InitialOffset.values()));
+            return 1;
+        }
+        return 0;
+    }
+
+    private static String allowedValues(EnumeratedValue[] values) {
+        return Arrays.stream(values)
+                .map(value -> "'" + value.getValue() + "'")
+                .collect(Collectors.joining(", "));
     }
 
     /**
