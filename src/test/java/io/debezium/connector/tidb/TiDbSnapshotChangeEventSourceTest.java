@@ -314,6 +314,31 @@ public class TiDbSnapshotChangeEventSourceTest {
     }
 
     @Test
+    public void shouldHonorRequestedTablesOfOnDemandSnapshotWithoutMovingStreamingPosition() throws Exception {
+        final SnapshotHarness harness = new SnapshotHarness(config().build(), new InitialSnapshotter());
+        final TiDbPartition partition = new TiDbPartition("tidb_server");
+
+        // Streaming is paused at commit_ts 150 after an initial snapshot at TSO 100
+        final TiDbOffsetContext streamingOffset = new TiDbOffsetContext.Loader(harness.connectorConfig)
+                .load(Map.of(
+                        TiDbOffsetContext.COMMIT_TS_KEY, 150L,
+                        TiDbOffsetContext.SNAPSHOT_TS_KEY, 100L));
+
+        final SnapshottingTask otherTable = new SnapshottingTask(false, true, List.of("inventory\\.orders"), Map.of(), true);
+        harness.source.execute(new AlwaysRunningContext(), partition, streamingOffset, otherTable);
+        assertThat(harness.poll()).isEmpty();
+
+        final SnapshottingTask products = new SnapshottingTask(false, true, List.of("inventory\\.products"), Map.of(), true);
+        final SnapshotResult<TiDbOffsetContext> result = harness.source.execute(new AlwaysRunningContext(), partition, streamingOffset, products);
+        assertThat(result.getStatus()).isEqualTo(SnapshotResult.SnapshotResultStatus.COMPLETED);
+        assertThat(harness.poll()).hasSize(2);
+
+        // Moving these forward would drop streamed events of tables the signal did not cover
+        assertThat(result.getOffset().getSnapshotTs()).isEqualTo(100L);
+        assertThat(result.getOffset().getCommitTs()).isEqualTo(150L);
+    }
+
+    @Test
     public void shouldApplyTableFilterToSnapshot() throws Exception {
         final SnapshotHarness harness = new SnapshotHarness(config()
                 .with("table.include.list", "inventory\\.orders")

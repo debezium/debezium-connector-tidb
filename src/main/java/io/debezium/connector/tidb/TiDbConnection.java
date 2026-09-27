@@ -100,7 +100,8 @@ public class TiDbConnection extends JdbcConnection {
     public Table readTableStructure(TableId tableId) throws SQLException {
         final TableEditor editor = Table.editor().tableId(tableId);
         final List<String> primaryKeyNames = new ArrayList<>();
-        prepareQuery("SELECT column_name, data_type, column_type, column_key, is_nullable"
+        prepareQuery("SELECT column_name, data_type, column_type, column_key, is_nullable,"
+                + " numeric_precision, numeric_scale, datetime_precision"
                 + " FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
                 statement -> {
                     statement.setString(1, tableId.catalog());
@@ -111,12 +112,36 @@ public class TiDbConnection extends JdbcConnection {
                     while (rs.next()) {
                         final String name = rs.getString(1);
                         final String dataType = rs.getString(2).toLowerCase();
+                        final String columnType = rs.getString(3);
                         final ColumnEditor column = Column.editor()
                                 .name(name)
-                                .type(rs.getString(3).toLowerCase())
+                                .type(columnType.toLowerCase())
                                 .jdbcType(jdbcTypeFor(dataType))
                                 .optional("YES".equalsIgnoreCase(rs.getString(5)))
                                 .position(position++);
+                        switch (dataType) {
+                            case "bit":
+                                column.length(rs.getInt(6));
+                                break;
+                            case "datetime":
+                            case "timestamp":
+                            case "time":
+                                column.length(rs.getInt(8));
+                                break;
+                            case "float":
+                                // numeric_scale is NULL for a plain FLOAT and set for FLOAT(M,D)
+                                final int scale = rs.getInt(7);
+                                if (!rs.wasNull()) {
+                                    column.scale(scale);
+                                }
+                                break;
+                            case "enum":
+                            case "set":
+                                column.enumValues(parseEnumValues(columnType));
+                                break;
+                            default:
+                                break;
+                        }
                         editor.addColumn(column.create());
                         if ("PRI".equalsIgnoreCase(rs.getString(4))) {
                             primaryKeyNames.add(name);
@@ -173,6 +198,44 @@ public class TiDbConnection extends JdbcConnection {
             default:
                 return rs.getObject(index);
         }
+    }
+
+    /**
+     * Extracts the labels of an ENUM or SET column type as reported by {@code information_schema},
+     * e.g. {@code enum('a','it''s','x,y')} yields {@code a}, {@code it's} and {@code x,y}. Quotes
+     * inside a label are doubled by the server.
+     */
+    static List<String> parseEnumValues(String columnType) {
+        final List<String> values = new ArrayList<>();
+        final int start = columnType.indexOf('(');
+        final int end = columnType.lastIndexOf(')');
+        if (start < 0 || end < start) {
+            return values;
+        }
+        final String body = columnType.substring(start + 1, end);
+        StringBuilder current = null;
+        for (int i = 0; i < body.length(); i++) {
+            final char c = body.charAt(i);
+            if (current == null) {
+                if (c == '\'') {
+                    current = new StringBuilder();
+                }
+            }
+            else if (c == '\'') {
+                if (i + 1 < body.length() && body.charAt(i + 1) == '\'') {
+                    current.append('\'');
+                    i++;
+                }
+                else {
+                    values.add(current.toString());
+                    current = null;
+                }
+            }
+            else {
+                current.append(c);
+            }
+        }
+        return values;
     }
 
     private static int jdbcTypeFor(String dataType) {

@@ -134,7 +134,12 @@ Per the maintainer guidance in DBZ-6269:
   restarts from the beginning when interrupted.
 * The TiCDC changefeed must emit JSON with inline schemas (`protocol=debezium` default).
 * Decimal values arrive as `float64` from TiCDC's Debezium output; precise decimal encoding
-  requires phase 2/3.
+  requires phase 2/3. Snapshot events use the same encodings as TiCDC so both describe a table
+  the same way: binary strings are base64 encoded strings, and `BIGINT UNSIGNED` values above
+  `9223372036854775807` wrap into negative `int64` values exactly as TiCDC encodes them.
+* An on demand (blocking) snapshot through the `execute-snapshot` signal snapshots only the
+  requested tables and does not move the streaming position; streamed changes of those tables
+  that occurred while streaming was paused are emitted again after the snapshot.
 * DDL and watermark events (TiCDC v9+) are skipped; schema changes are picked up lazily from the
   data messages.
 * Single task; parallelism is bounded by the TiCDC topic partitioning for now.
