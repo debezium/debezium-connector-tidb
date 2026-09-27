@@ -113,7 +113,12 @@ public class TiDbSnapshotChangeEventSource extends AbstractSnapshotChangeEventSo
 
         try (TiDbConnection connection = createConnection()) {
             final long tso = connection.currentTso();
-            final List<TableId> tables = connection.capturedTables(connectorConfig.getTableFilters().dataCollectionFilter());
+            // An on demand snapshot signal names the tables to snapshot; an empty list means all
+            // captured tables
+            final List<TableId> tables = determineDataCollectionsToBeSnapshotted(
+                    connection.capturedTables(connectorConfig.getTableFilters().dataCollectionFilter()),
+                    getDataCollectionPattern(snapshottingTask.getDataCollections()))
+                    .toList();
             LOGGER.info("Snapshotting {} table(s) at TSO {}", tables.size(), tso);
 
             connection.initSnapshotSession(tso);

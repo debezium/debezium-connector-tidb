@@ -133,12 +133,20 @@ public class TiDbOffsetContext extends CommonOffsetContext<SourceInfo> {
     }
 
     /**
-     * Marks the start of the initial snapshot taken at the given TSO.
+     * Marks the start of a snapshot taken at the given TSO.
+     * <p>
+     * Only the initial snapshot moves the streaming position: an on demand snapshot runs while
+     * the TiCDC stream is paused at an earlier commit timestamp and may cover only some tables, so
+     * moving the snapshot TSO forward would drop streamed events of the tables it did not cover.
+     * Streamed events of the snapshotted tables between the pause point and the snapshot TSO are
+     * emitted again, which is the usual at least once behavior of blocking snapshots.
      */
     public void snapshotStarted(long tso, boolean onDemand) {
         preSnapshotStart(onDemand);
-        this.snapshotTs = tso;
-        this.commitTs = tso;
+        if (!onDemand) {
+            this.snapshotTs = tso;
+            this.commitTs = tso;
+        }
     }
 
     /**
@@ -146,7 +154,6 @@ public class TiDbOffsetContext extends CommonOffsetContext<SourceInfo> {
      * is no TiCDC stream position during a snapshot.
      */
     public void snapshotEvent(TableId tableId, Instant timestamp, long tso) {
-        this.commitTs = tso;
         sourceInfo.update(tableId, timestamp, tso, null);
     }
 
