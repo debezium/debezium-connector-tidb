@@ -39,6 +39,28 @@ public class TiDbOffsetContextTest {
     }
 
     @Test
+    public void shouldRoundTripSnapshotState() {
+        final TiDbConnectorConfig config = connectorConfig();
+        final TiDbOffsetContext offsetContext = TiDbOffsetContext.empty(config);
+
+        offsetContext.snapshotStarted(446245805252059200L, false);
+        offsetContext.snapshotEvent(new TableId("inventory", null, "products"),
+                Instant.ofEpochMilli(1717000000000L), 446245805252059200L);
+
+        final TiDbOffsetContext loadedDuringSnapshot = new TiDbOffsetContext.Loader(config).load(offsetContext.getOffset());
+        assertThat(loadedDuringSnapshot.isInitialSnapshotRunning()).isTrue();
+        assertThat(loadedDuringSnapshot.getSnapshotTs()).isEqualTo(446245805252059200L);
+        assertThat(loadedDuringSnapshot.getCommitTs()).isEqualTo(446245805252059200L);
+
+        offsetContext.preSnapshotCompletion();
+        offsetContext.postSnapshotCompletion();
+
+        final TiDbOffsetContext loadedAfterSnapshot = new TiDbOffsetContext.Loader(config).load(offsetContext.getOffset());
+        assertThat(loadedAfterSnapshot.isInitialSnapshotRunning()).isFalse();
+        assertThat(loadedAfterSnapshot.getSnapshotTs()).isEqualTo(446245805252059200L);
+    }
+
+    @Test
     public void shouldRoundTripOffsets() {
         final TiDbConnectorConfig config = connectorConfig();
         final TiDbOffsetContext offsetContext = TiDbOffsetContext.empty(config);

@@ -125,6 +125,16 @@ public class TiCdcStreamingChangeEventSource implements StreamingChangeEventSour
             return;
         }
 
+        if (event.commitTs() > 0 && event.commitTs() <= offsetContext.getSnapshotTs()) {
+            // The initial snapshot already captured this state; the changefeed replays history
+            // from before the snapshot TSO
+            LOGGER.debug("Skipping event with commit_ts {} at or before the snapshot TSO {}",
+                    event.commitTs(), offsetContext.getSnapshotTs());
+            offsetContext.event(null, clock.currentTimeAsInstant(), offsetContext.getCommitTs(), null,
+                    record.topic(), record.partition(), record.offset() + 1);
+            return;
+        }
+
         final TableId tableId = event.tableId();
         offsetContext.event(tableId, event.sourceTimestamp(), event.commitTs(), event.clusterId(),
                 record.topic(), record.partition(), record.offset() + 1);
