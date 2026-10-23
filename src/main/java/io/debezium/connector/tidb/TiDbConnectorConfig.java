@@ -27,6 +27,7 @@ import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
 import io.debezium.connector.AbstractSourceInfo;
 import io.debezium.connector.SourceInfoStructMaker;
+import io.debezium.heartbeat.DatabaseHeartbeatImpl;
 import io.debezium.relational.ColumnFilterMode;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.TableId;
@@ -41,14 +42,18 @@ import io.debezium.util.Strings;
  * The connector consumes the Debezium-format output of a TiCDC changefeed
  * ({@code protocol=debezium}) from Kafka and layers the Debezium connector framework on top of
  * it: managed offsets, the standard event envelope with a TiDB-specific {@code source} block,
- * table filtering, and (in subsequent iterations) initial and incremental snapshots through
- * TiDB's MySQL-compatible SQL endpoint.
+ * table filtering, and initial and on demand snapshots through TiDB's MySQL compatible SQL
+ * endpoint.
  *
  * @author Aviral Srivastava
  */
 public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
 
-    protected static final int DEFAULT_SNAPSHOT_FETCH_SIZE = 2_000;
+    /**
+     * Stream snapshot rows one by one rather than reading whole tables into memory, as the MySQL
+     * connector does; a positive {@code snapshot.fetch.size} fetches through a server side cursor.
+     */
+    protected static final int DEFAULT_SNAPSHOT_FETCH_SIZE = Integer.MIN_VALUE;
 
     protected static final String TICDC_CONSUMER_PREFIX = "ticdc.consumer.";
 
@@ -198,7 +203,7 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
             .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 3))
             .withWidth(Width.MEDIUM)
             .withImportance(Importance.MEDIUM)
-            .withValidation(TiDbConnectorConfig::validateSnapshotConnection)
+            .withValidation(TiDbConnectorConfig::validateSqlEndpoint)
             .withDescription("Resolvable hostname or IP address of the TiDB SQL endpoint. "
                     + "Only required when the snapshot mode captures data.");
 
@@ -235,6 +240,34 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
     public static final Field TOPIC_NAMING_STRATEGY = CommonConnectorConfig.TOPIC_NAMING_STRATEGY
             .withDefault(DefaultTopicNamingStrategy.class.getName());
 
+    // Options of the relational framework whose behavior is fixed by the TiCDC encoding, or which
+    // the connector does not support. They are rejected rather than silently ignored.
+
+    public static final Field DECIMAL_HANDLING_MODE = RelationalDatabaseConnectorConfig.DECIMAL_HANDLING_MODE
+            .withValidation((config, field, problems) -> requireValue(config, field, problems, "double",
+                    "TiCDC encodes DECIMAL values as double"));
+
+    public static final Field TIME_PRECISION_MODE = RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE
+            .withValidation((config, field, problems) -> requireValue(config, field, problems, "adaptive_time_microseconds",
+                    "TiCDC encodes temporal values with adaptive precision and TIME values in microseconds"));
+
+    public static final Field BINARY_HANDLING_MODE = CommonConnectorConfig.BINARY_HANDLING_MODE
+            .withValidation((config, field, problems) -> requireValue(config, field, problems, "base64",
+                    "TiCDC encodes binary values as base64 strings"));
+
+    public static final Field CUSTOM_CONVERTERS = CommonConnectorConfig.CUSTOM_CONVERTERS
+            .withValidation((config, field, problems) -> rejectValue(config, field, problems,
+                    "custom converters are not supported by the TiDB connector"));
+
+    public static final Field INCLUDE_SCHEMA_COMMENTS = RelationalDatabaseConnectorConfig.INCLUDE_SCHEMA_COMMENTS
+            .withValidation((config, field, problems) -> config.getBoolean(field)
+                    ? reject(field, config.getString(field), problems, "column comments are not available in the TiCDC stream")
+                    : 0);
+
+    public static final Field HEARTBEAT_ACTION_QUERY = DatabaseHeartbeatImpl.HEARTBEAT_ACTION_QUERY
+            .withValidation((config, field, problems) -> rejectValue(config, field, problems,
+                    "heartbeat action queries are not supported by the TiDB connector"));
+
     private static final ConfigDefinition CONFIG_DEFINITION = RelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
             .name("TiDB")
             // The base relational connection fields are required fields; the connector replaces
@@ -244,14 +277,18 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
             .group(Field.Group.CONNECTION, TICDC_BOOTSTRAP_SERVERS, TICDC_TOPICS, JDBC_HOSTNAME, JDBC_PORT, JDBC_USER, JDBC_PASSWORD)
             .group(Field.Group.CONNECTION_ADVANCED, TICDC_POLL_TIMEOUT_MS, TICDC_INITIAL_OFFSET)
             .group(Field.Group.CONNECTOR_SNAPSHOT, SNAPSHOT_MODE)
-            .group(Field.Group.CONNECTOR_ADVANCED, SOURCE_INFO_STRUCT_MAKER, TOPIC_NAMING_STRATEGY)
+            // Replaces the inherited definitions in place, adding the validators
+            .group(Field.Group.CONNECTOR, DECIMAL_HANDLING_MODE, TIME_PRECISION_MODE, INCLUDE_SCHEMA_COMMENTS, BINARY_HANDLING_MODE)
+            .group(Field.Group.CONNECTOR_ADVANCED, SOURCE_INFO_STRUCT_MAKER, TOPIC_NAMING_STRATEGY, CUSTOM_CONVERTERS)
+            .group(Field.Group.ADVANCED_HEARTBEAT, HEARTBEAT_ACTION_QUERY)
             .create();
 
     /**
      * Validates that the SQL endpoint connection is configured when the selected snapshot mode
-     * needs to read data from TiDB.
+     * needs to read data from TiDB, or when column mappers need the source column metadata that
+     * only the SQL endpoint provides.
      */
-    private static int validateSnapshotConnection(Configuration config, Field field, Field.ValidationOutput problems) {
+    private static int validateSqlEndpoint(Configuration config, Field field, Field.ValidationOutput problems) {
         final String modeValue = config.getString(SNAPSHOT_MODE);
         final SnapshotMode mode = SnapshotMode.parse(modeValue);
         if (mode == null) {
@@ -261,21 +298,57 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
                     + allowedValues(SnapshotMode.values()));
             return 1;
         }
-        if (mode == SnapshotMode.NO_DATA) {
+        final String reason;
+        if (mode != SnapshotMode.NO_DATA) {
+            reason = "'" + SNAPSHOT_MODE_PROPERTY_NAME + "' is '" + mode.getValue() + "'";
+        }
+        else if (requiresSourceColumnMetadata(config)) {
+            reason = "column masking, truncation or source type propagation is configured";
+        }
+        else {
             return 0;
         }
         int problemCount = 0;
         if (Strings.isNullOrEmpty(config.getString(JDBC_HOSTNAME))) {
-            problems.accept(JDBC_HOSTNAME, null, "'" + JDBC_HOSTNAME.name() + "' is required when '"
-                    + SNAPSHOT_MODE_PROPERTY_NAME + "' is '" + mode.getValue() + "'");
+            problems.accept(JDBC_HOSTNAME, null, "'" + JDBC_HOSTNAME.name() + "' is required when " + reason);
             problemCount++;
         }
         if (Strings.isNullOrEmpty(config.getString(JDBC_USER))) {
-            problems.accept(JDBC_USER, null, "'" + JDBC_USER.name() + "' is required when '"
-                    + SNAPSHOT_MODE_PROPERTY_NAME + "' is '" + mode.getValue() + "'");
+            problems.accept(JDBC_USER, null, "'" + JDBC_USER.name() + "' is required when " + reason);
             problemCount++;
         }
         return problemCount;
+    }
+
+    /**
+     * @return {@code true} if column mappers are configured that depend on the source column
+     *         metadata (type, length), which only the SQL endpoint provides
+     */
+    private static boolean requiresSourceColumnMetadata(Configuration config) {
+        return config.keys().stream().anyMatch(key -> key.startsWith("column.mask.") || key.startsWith("column.truncate."))
+                || !Strings.isNullOrBlank(config.getString(PROPAGATE_COLUMN_SOURCE_TYPE))
+                || !Strings.isNullOrBlank(config.getString(PROPAGATE_DATATYPE_SOURCE_TYPE));
+    }
+
+    private static int requireValue(Configuration config, Field field, Field.ValidationOutput problems, String supported, String reason) {
+        final String value = config.getString(field.name());
+        if (value != null && !supported.equalsIgnoreCase(value.trim())) {
+            return reject(field, value, problems, "only '" + supported + "' is supported because " + reason);
+        }
+        return 0;
+    }
+
+    private static int rejectValue(Configuration config, Field field, Field.ValidationOutput problems, String reason) {
+        final String value = config.getString(field.name());
+        if (!Strings.isNullOrBlank(value)) {
+            return reject(field, value, problems, reason);
+        }
+        return 0;
+    }
+
+    private static int reject(Field field, String value, Field.ValidationOutput problems, String reason) {
+        problems.accept(field, value, "'" + field.name() + "' is not supported: " + reason);
+        return 1;
     }
 
     /**
@@ -311,6 +384,8 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
     private final List<String> ticdcTopics;
     private final Duration ticdcPollTimeout;
     private final Properties ticdcConsumerProperties;
+    private final boolean sqlEndpointConfigured;
+    private final boolean requiresSourceColumnMetadata;
 
     public TiDbConnectorConfig(Configuration config) {
         super(
@@ -330,6 +405,8 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
         if (!Strings.isNullOrEmpty(ticdcBootstrapServers)) {
             this.ticdcConsumerProperties.put("bootstrap.servers", ticdcBootstrapServers);
         }
+        this.sqlEndpointConfigured = !Strings.isNullOrEmpty(config.getString(JDBC_HOSTNAME));
+        this.requiresSourceColumnMetadata = requiresSourceColumnMetadata(config);
     }
 
     public static boolean isBuiltInDatabase(String databaseName) {
@@ -357,6 +434,21 @@ public class TiDbConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     public InitialOffset getTicdcInitialOffset() {
         return initialOffset;
+    }
+
+    /**
+     * @return {@code true} if the TiDB SQL endpoint is configured
+     */
+    public boolean isSqlEndpointConfigured() {
+        return sqlEndpointConfigured;
+    }
+
+    /**
+     * @return {@code true} if column mappers are configured that depend on the source column
+     *         metadata, which only the SQL endpoint provides
+     */
+    public boolean requiresSourceColumnMetadata() {
+        return requiresSourceColumnMetadata;
     }
 
     /**

@@ -49,6 +49,8 @@ public class TiDbJdbcValueConverters implements ValueConverterProvider {
 
     private static final String VECTOR_SCHEMA_NAME = "io.debezium.data.TiDBVectorFloat32";
 
+    static final String EPOCH_ZONED_TIMESTAMP = "1970-01-01T00:00:00Z";
+
     @Override
     public SchemaBuilder schemaBuilder(Column column) {
         switch (baseType(column)) {
@@ -119,8 +121,12 @@ public class TiDbJdbcValueConverters implements ValueConverterProvider {
                         ? bigInteger.longValue()
                         : ((Number) value).longValue());
             case "float":
+                // TiCDC writes the float32 value with its shortest decimal form, which reads back
+                // as e.g. 1234.567 rather than the widened 1234.5670166015625
                 return column.scale().isPresent()
-                        ? nullSafe(value -> ((Number) value).doubleValue())
+                        ? nullSafe(value -> value instanceof Float floatValue
+                                ? Double.parseDouble(floatValue.toString())
+                                : ((Number) value).doubleValue())
                         : nullSafe(value -> ((Number) value).floatValue());
             case "double":
                 return nullSafe(value -> ((Number) value).doubleValue());
@@ -132,23 +138,26 @@ public class TiDbJdbcValueConverters implements ValueConverterProvider {
                 return bitLength(column) == 1
                         ? nullSafe(value -> toBoolean(column, value))
                         : nullSafe(value -> toLittleEndianBits(column, value));
+            // The driver reports zero dates such as 0000-00-00 as null. TiCDC encodes them as the
+            // epoch in NOT NULL columns and as null otherwise, and the same rule is applied here
             case "date":
-                return nullSafe(value -> {
+                return zeroDateSafe(column, 0, value -> {
                     if (value instanceof LocalDate localDate) {
                         return (int) localDate.toEpochDay();
                     }
                     throw unexpectedValue(column, value);
                 });
             case "datetime":
-                return nullSafe(value -> {
+                return zeroDateSafe(column, 0L, value -> {
                     if (value instanceof LocalDateTime localDateTime) {
-                        final long micros = Duration.between(LocalDateTime.of(1970, 1, 1, 0, 0), localDateTime).toNanos() / 1_000;
-                        return fsp(column) <= 3 ? Math.floorDiv(micros, 1_000L) : micros;
+                        return fsp(column) <= 3
+                                ? io.debezium.time.Timestamp.toEpochMillis(localDateTime, null)
+                                : MicroTimestamp.toEpochMicros(localDateTime, null);
                     }
                     throw unexpectedValue(column, value);
                 });
             case "timestamp":
-                return nullSafe(value -> {
+                return zeroDateSafe(column, EPOCH_ZONED_TIMESTAMP, value -> {
                     if (value instanceof LocalDateTime localDateTime) {
                         // Exactly the declared number of fractional digits, as TiCDC emits them
                         return ZonedTimestamp.toIsoString(localDateTime.atZone(ZoneOffset.UTC), null, fsp(column));
@@ -163,7 +172,20 @@ public class TiDbJdbcValueConverters implements ValueConverterProvider {
                     throw unexpectedValue(column, value);
                 });
             case "year":
-                return nullSafe(value -> ((Number) value).intValue());
+                // The connection disables yearIsDateType so YEAR arrives as a number; a date is
+                // still accepted in case the driver option is overridden
+                return nullSafe(value -> {
+                    if (value instanceof Number number) {
+                        return number.intValue();
+                    }
+                    if (value instanceof java.sql.Date date) {
+                        return date.toLocalDate().getYear();
+                    }
+                    if (value instanceof LocalDate localDate) {
+                        return localDate.getYear();
+                    }
+                    throw unexpectedValue(column, value);
+                });
             case "binary":
             case "varbinary":
             case "tinyblob":
@@ -202,11 +224,11 @@ public class TiDbJdbcValueConverters implements ValueConverterProvider {
                 || column.typeName().toLowerCase().contains(" unsigned ");
     }
 
-    private static int fsp(Column column) {
+    static int fsp(Column column) {
         return Math.max(column.length(), 0);
     }
 
-    private static int bitLength(Column column) {
+    static int bitLength(Column column) {
         return Math.max(column.length(), 1);
     }
 
@@ -232,7 +254,7 @@ public class TiDbJdbcValueConverters implements ValueConverterProvider {
      * The driver returns BIT values big endian; Debezium's {@code Bits} and TiCDC use little endian
      * bytes sized to hold the declared number of bits.
      */
-    private static byte[] toLittleEndianBits(Column column, Object value) {
+    static byte[] toLittleEndianBits(Column column, Object value) {
         final byte[] bigEndian;
         if (value instanceof byte[] bytes) {
             bigEndian = bytes;
@@ -255,12 +277,19 @@ public class TiDbJdbcValueConverters implements ValueConverterProvider {
         return value -> value == null ? null : converter.convert(value);
     }
 
+    private static ValueConverter zeroDateSafe(Column column, Object epoch, ValueConverter converter) {
+        if (column.isOptional()) {
+            return nullSafe(converter);
+        }
+        return value -> value == null ? epoch : converter.convert(value);
+    }
+
     /**
      * Converts a TiDB TIME literal, e.g. {@code 13:45:30} or {@code -838:59:59}, to microseconds.
      * The type is a duration and can exceed 24 hours or be negative, so it cannot be parsed as a
      * time of day.
      */
-    private static long timeMicros(String text) {
+    static long timeMicros(String text) {
         final boolean negative = text.startsWith("-");
         final String[] parts = (negative ? text.substring(1) : text).split(":");
         if (parts.length != 3) {

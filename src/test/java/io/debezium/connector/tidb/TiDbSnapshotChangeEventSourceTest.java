@@ -26,6 +26,7 @@ import io.debezium.connector.base.ChangeEventQueue;
 import io.debezium.connector.common.DebeziumHeaderProducer;
 import io.debezium.connector.tidb.snapshot.query.SelectAllSnapshotQuery;
 import io.debezium.data.Envelope;
+import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.pipeline.DataChangeEvent;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.notification.NotificationService;
@@ -79,6 +80,7 @@ public class TiDbSnapshotChangeEventSourceTest {
         final ChangeEventQueue<DataChangeEvent> queue;
         final TiDbSnapshotChangeEventSource source;
         final TiDbSchema schema;
+        final List<String> calls = new java.util.ArrayList<>();
 
         SnapshotHarness(Configuration config, Snapshotter snapshotter) {
             this.connectorConfig = new TiDbConnectorConfig(config);
@@ -86,7 +88,7 @@ public class TiDbSnapshotChangeEventSourceTest {
             final TopicNamingStrategy<TableId> topicNamingStrategy = connectorConfig.getTopicNamingStrategy(TiDbConnectorConfig.TOPIC_NAMING_STRATEGY);
             final SchemaNameAdjuster adjuster = connectorConfig.schemaNameAdjuster();
 
-            this.schema = new TiDbSchema(topicNamingStrategy, connectorConfig.getSourceInfoStructMaker().schema(), adjuster);
+            this.schema = new TiDbSchema(connectorConfig, topicNamingStrategy);
             this.queue = new ChangeEventQueue.Builder<DataChangeEvent>()
                     .pollInterval(connectorConfig.getPollInterval())
                     .maxBatchSize(connectorConfig.getMaxBatchSize())
@@ -112,10 +114,10 @@ public class TiDbSnapshotChangeEventSourceTest {
                     });
 
             this.source = new TiDbSnapshotChangeEventSource(connectorConfig, snapshotterService, dispatcher,
-                    Clock.system(), schema, topicNamingStrategy, SnapshotProgressListener.NO_OP(), notificationService) {
+                    Clock.system(), schema, SnapshotProgressListener.NO_OP(), notificationService) {
                 @Override
                 protected TiDbConnection createConnection() {
-                    return new FakeTiDbConnection(connectorConfig);
+                    return new FakeTiDbConnection(connectorConfig, calls);
                 }
             };
         }
@@ -129,8 +131,11 @@ public class TiDbSnapshotChangeEventSourceTest {
 
     private static class FakeTiDbConnection extends TiDbConnection {
 
-        FakeTiDbConnection(TiDbConnectorConfig connectorConfig) {
+        private final List<String> calls;
+
+        FakeTiDbConnection(TiDbConnectorConfig connectorConfig, List<String> calls) {
             super(connectorConfig);
+            this.calls = calls;
         }
 
         @Override
@@ -141,10 +146,12 @@ public class TiDbSnapshotChangeEventSourceTest {
         @Override
         public void initSnapshotSession(long tso) {
             assertThat(tso).isEqualTo(TSO);
+            calls.add("initSnapshotSession");
         }
 
         @Override
         public List<TableId> capturedTables(TableFilter tableFilter) {
+            calls.add("capturedTables");
             return List.of(PRODUCTS).stream().filter(tableFilter::isIncluded).collect(Collectors.toList());
         }
 
@@ -154,8 +161,8 @@ public class TiDbSnapshotChangeEventSourceTest {
         }
 
         @Override
-        public void fetchRows(String snapshotQuery, List<Column> columns, RowConsumer consumer) throws InterruptedException {
-            assertThat(snapshotQuery).isEqualTo("SELECT `id`, `name`, `weight` FROM `inventory`.`products`");
+        public void fetchRows(String snapshotQuery, List<Column> columns, int rowWidth, RowConsumer consumer) throws InterruptedException {
+            calls.add(snapshotQuery);
             for (Object[] row : PRODUCT_ROWS) {
                 consumer.accept(row);
             }
@@ -276,6 +283,10 @@ public class TiDbSnapshotChangeEventSourceTest {
         assertThat(result.getOffset().getSnapshotTs()).isEqualTo(TSO);
         assertThat(result.getOffset().getCommitTs()).isEqualTo(TSO);
 
+        // The table list is read with the session already pinned to the snapshot TSO
+        assertThat(harness.calls).containsExactly("initSnapshotSession", "capturedTables",
+                "SELECT `id`, `name`, `weight` FROM `inventory`.`products`");
+
         final List<SourceRecord> records = harness.poll();
         assertThat(records).hasSize(2);
 
@@ -349,6 +360,55 @@ public class TiDbSnapshotChangeEventSourceTest {
         final SnapshotResult<TiDbOffsetContext> result = harness.source.execute(new AlwaysRunningContext(), partition, null, task);
 
         assertThat(result.getStatus()).isEqualTo(SnapshotResult.SnapshotResultStatus.COMPLETED);
+        assertThat(harness.poll()).isEmpty();
+    }
+
+    @Test
+    public void shouldWarnAboutAndIgnoreSnapshotSelectStatementOverrides() throws Exception {
+        final LogInterceptor logInterceptor = new LogInterceptor(TiDbSnapshotChangeEventSource.class);
+        final String override = "SELECT `id`, `name`, `weight` FROM `inventory`.`products` WHERE `id` > 10";
+        final SnapshotHarness harness = new SnapshotHarness(config()
+                .with("snapshot.select.statement.overrides", "inventory.products")
+                .with("snapshot.select.statement.overrides.inventory.products", override)
+                .build(), new InitialSnapshotter());
+        final TiDbPartition partition = new TiDbPartition("tidb_server");
+
+        final SnapshottingTask task = harness.source.getSnapshottingTask(partition, null);
+        harness.source.execute(new AlwaysRunningContext(), partition, null, task);
+
+        assertThat(harness.calls).doesNotContain(override);
+        assertThat(logInterceptor.containsWarnMessage("'snapshot.select.statement.overrides' is not supported")).isTrue();
+    }
+
+    @Test
+    public void shouldApplyAdditionalConditionsOfBlockingSnapshotSignal() throws Exception {
+        final SnapshotHarness harness = new SnapshotHarness(config().build(), new InitialSnapshotter());
+        final TiDbPartition partition = new TiDbPartition("tidb_server");
+        final String filter = "SELECT `id`, `name`, `weight` FROM `inventory`.`products` WHERE `name` = 'scooter'";
+
+        final SnapshottingTask task = harness.source.getBlockingSnapshottingTask(partition, null,
+                io.debezium.pipeline.signal.actions.snapshotting.SnapshotConfiguration.Builder.builder()
+                        .dataCollections(List.of("inventory.products"))
+                        .addCondition(io.debezium.pipeline.signal.actions.snapshotting.AdditionalCondition.AdditionalConditionBuilder.builder()
+                                .dataCollection(java.util.regex.Pattern.compile("inventory.products"))
+                                .filter(filter)
+                                .build())
+                        .build());
+        harness.source.execute(new AlwaysRunningContext(), partition, TiDbOffsetContext.empty(harness.connectorConfig), task);
+
+        assertThat(harness.calls).contains(filter);
+    }
+
+    @Test
+    public void shouldHonorSnapshotIncludeCollectionList() throws Exception {
+        final SnapshotHarness harness = new SnapshotHarness(config()
+                .with(CommonConnectorConfig.SNAPSHOT_MODE_TABLES, "inventory.orders")
+                .build(), new InitialSnapshotter());
+        final TiDbPartition partition = new TiDbPartition("tidb_server");
+
+        final SnapshottingTask task = harness.source.getSnapshottingTask(partition, null);
+        harness.source.execute(new AlwaysRunningContext(), partition, null, task);
+
         assertThat(harness.poll()).isEmpty();
     }
 }

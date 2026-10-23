@@ -67,7 +67,7 @@ public class TiCdcStreamingChangeEventSourceTest {
             final TopicNamingStrategy<TableId> topicNamingStrategy = connectorConfig.getTopicNamingStrategy(TiDbConnectorConfig.TOPIC_NAMING_STRATEGY);
             final SchemaNameAdjuster adjuster = connectorConfig.schemaNameAdjuster();
 
-            this.schema = new TiDbSchema(topicNamingStrategy, connectorConfig.getSourceInfoStructMaker().schema(), adjuster);
+            this.schema = new TiDbSchema(connectorConfig, topicNamingStrategy);
             this.queue = new ChangeEventQueue.Builder<DataChangeEvent>()
                     .pollInterval(connectorConfig.getPollInterval())
                     .maxBatchSize(connectorConfig.getMaxBatchSize())
@@ -101,11 +101,16 @@ public class TiCdcStreamingChangeEventSourceTest {
         }
 
         List<SourceRecord> run(TiDbOffsetContext offsetContext, List<ConsumerRecord<byte[], byte[]>> messages) throws InterruptedException {
+            return run(new StoppableContext(running), offsetContext, messages);
+        }
+
+        List<SourceRecord> run(StoppableContext context, TiDbOffsetContext offsetContext, List<ConsumerRecord<byte[], byte[]>> messages)
+                throws InterruptedException {
             consumer.schedulePollTask(() -> messages.forEach(consumer::addRecord));
             consumer.schedulePollTask(() -> running.set(false));
 
             source.init(offsetContext);
-            source.execute(new StoppableContext(running), new TiDbPartition(connectorConfig.getLogicalName()), source.getOffsetContext());
+            source.execute(context, new TiDbPartition(connectorConfig.getLogicalName()), source.getOffsetContext());
 
             return queue.poll().stream()
                     .map(DataChangeEvent::getRecord)
@@ -116,6 +121,8 @@ public class TiCdcStreamingChangeEventSourceTest {
     private static class StoppableContext implements ChangeEventSourceContext {
 
         private final AtomicBoolean running;
+        private final AtomicBoolean paused = new AtomicBoolean(false);
+        private final List<String> calls = new java.util.ArrayList<>();
 
         StoppableContext(AtomicBoolean running) {
             this.running = running;
@@ -123,7 +130,7 @@ public class TiCdcStreamingChangeEventSourceTest {
 
         @Override
         public boolean isPaused() {
-            return false;
+            return paused.get();
         }
 
         @Override
@@ -137,10 +144,13 @@ public class TiCdcStreamingChangeEventSourceTest {
 
         @Override
         public void waitSnapshotCompletion() {
+            calls.add("waitSnapshotCompletion");
+            paused.set(false);
         }
 
         @Override
         public void streamingPaused() {
+            calls.add("streamingPaused");
         }
 
         @Override
@@ -295,5 +305,55 @@ public class TiCdcStreamingChangeEventSourceTest {
         assertThat(deleteValue.getString(Envelope.FieldName.OPERATION)).isEqualTo(Envelope.Operation.DELETE.code());
         assertThat(deleteValue.getStruct(Envelope.FieldName.BEFORE).getString("name")).isEqualTo("scooter");
         assertThat(records.get(1).value()).isNull();
+    }
+
+    @Test
+    public void shouldPauseForBlockingSnapshot() throws InterruptedException {
+        final StreamingHarness harness = new StreamingHarness(config().build());
+        final StoppableContext context = new StoppableContext(harness.running);
+        context.paused.set(true);
+
+        final List<SourceRecord> records = harness.run(context, null, List.of(
+                record(0, null, TiCdcTestMessages.createMessage("inventory", "products", 1, "after-pause", 100L))));
+
+        // Streaming reports the pause and waits for the snapshot before reading further
+        assertThat(context.calls).containsExactly("streamingPaused", "waitSnapshotCompletion");
+        assertThat(records).hasSize(1);
+    }
+
+    @Test
+    public void shouldApplyMessageKeyColumnsAndColumnFiltersToStreamedEvents() throws InterruptedException {
+        final StreamingHarness harness = new StreamingHarness(config()
+                .with("message.key.columns", "inventory.products:name")
+                .with("column.exclude.list", "inventory\\.products\\.id")
+                .build());
+
+        final List<SourceRecord> records = harness.run(null, List.of(
+                record(0, TiCdcTestMessages.keyMessage("inventory", "products", 17),
+                        TiCdcTestMessages.createMessage("inventory", "products", 17, "scooter", 100L))));
+
+        assertThat(records).hasSize(1);
+        final Struct key = (Struct) records.get(0).key();
+        assertThat(key.schema().fields()).extracting(org.apache.kafka.connect.data.Field::name).containsExactly("name");
+        assertThat(key.getString("name")).isEqualTo("scooter");
+        final Struct after = ((Struct) records.get(0).value()).getStruct(Envelope.FieldName.AFTER);
+        assertThat(after.schema().field("id")).isNull();
+        assertThat(after.getString("name")).isEqualTo("scooter");
+    }
+
+    @Test
+    public void shouldSkipUnparseableMessagesWhenConfiguredToWarn() throws InterruptedException {
+        final StreamingHarness harness = new StreamingHarness(config()
+                .with(CommonConnectorConfig.EVENT_PROCESSING_FAILURE_HANDLING_MODE, "warn")
+                .build());
+
+        final List<SourceRecord> records = harness.run(null, List.of(
+                record(0, null, "not json".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                record(1, null, TiCdcTestMessages.createMessage("inventory", "products", 2, "valid", 200L))));
+
+        assertThat(records).hasSize(1);
+        @SuppressWarnings("unchecked")
+        final Map<String, Object> sourceOffset = (Map<String, Object>) records.get(0).sourceOffset();
+        assertThat(sourceOffset).containsEntry(TiDbOffsetContext.TICDC_OFFSETS_KEY, TICDC_TOPIC + ":0=2");
     }
 }

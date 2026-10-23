@@ -182,4 +182,41 @@ public class TiDbJdbcValueConvertersTest {
         assertThat(TiDbJdbcValueConverters.isUnsigned(column("a", "int(11) unsigned", Types.INTEGER))).isTrue();
         assertThat(TiDbJdbcValueConverters.isUnsigned(column("b", "int(11)", Types.INTEGER))).isFalse();
     }
+
+    @Test
+    public void shouldConvertDatetimeOutsideTheNanosecondRange() {
+        // Durations in nanoseconds only cover the years 1677 to 2262
+        final Column millis = Column.editor().name("d").type("datetime").jdbcType(Types.TIMESTAMP).length(0).optional(true).create();
+        final Column micros = Column.editor().name("d").type("datetime(6)").jdbcType(Types.TIMESTAMP).length(6).optional(true).create();
+        assertThat(convert(millis, LocalDateTime.of(9999, 12, 31, 23, 59, 59))).isEqualTo(253402300799000L);
+        assertThat(convert(millis, LocalDateTime.of(1000, 1, 1, 0, 0, 0, 123_000_000))).isEqualTo(-30610223999877L);
+        assertThat(convert(micros, LocalDateTime.of(9999, 12, 31, 23, 59, 59, 999_999_000))).isEqualTo(253402300799999999L);
+    }
+
+    @Test
+    public void shouldConvertYearFromNumberOrDate() {
+        final Column year = column("y", "year", Types.INTEGER);
+        assertThat(convert(year, (short) 2024)).isEqualTo(2024);
+        // yearIsDateType=true, the driver default, reports YEAR as a date
+        assertThat(convert(year, java.sql.Date.valueOf("2024-01-01"))).isEqualTo(2024);
+        assertThat(convert(year, LocalDate.of(1999, 1, 1))).isEqualTo(1999);
+    }
+
+    @Test
+    public void shouldConvertZeroDatesInNotNullColumnsLikeTiCdc() {
+        // The driver reports 0000-00-00 as null; TiCDC writes the epoch for NOT NULL columns
+        final Column date = Column.editor().name("d").type("date").jdbcType(Types.DATE).optional(false).create();
+        final Column datetime = Column.editor().name("d").type("datetime").jdbcType(Types.TIMESTAMP).optional(false).create();
+        final Column timestamp = Column.editor().name("d").type("timestamp").jdbcType(Types.TIMESTAMP).optional(false).create();
+        assertThat(convert(date, null)).isEqualTo(0);
+        assertThat(convert(datetime, null)).isEqualTo(0L);
+        assertThat(convert(timestamp, null)).isEqualTo("1970-01-01T00:00:00Z");
+        assertThat(convert(column("d", "date", Types.DATE), null)).isNull();
+    }
+
+    @Test
+    public void shouldWriteScaledFloatsWithTheirShortestDecimalFormLikeTiCdc() {
+        final Column scaled = Column.editor().name("f").type("float(7,3)").jdbcType(Types.REAL).scale(3).optional(true).create();
+        assertThat(convert(scaled, 1234.567f)).isEqualTo(1234.567d);
+    }
 }

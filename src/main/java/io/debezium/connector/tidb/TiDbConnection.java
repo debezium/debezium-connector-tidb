@@ -7,13 +7,22 @@ package io.debezium.connector.tidb;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.TreeMap;
 
 import io.debezium.DebeziumException;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
+import io.debezium.relational.Attribute;
 import io.debezium.relational.Column;
 import io.debezium.relational.ColumnEditor;
 import io.debezium.relational.Table;
@@ -38,21 +47,37 @@ import io.debezium.relational.Tables.TableFilter;
 public class TiDbConnection extends JdbcConnection {
 
     private static final String URL_PATTERN = "jdbc:mysql://${hostname}:${port}/?connectTimeout=${connectTimeout}"
-            + "&zeroDateTimeBehavior=CONVERT_TO_NULL&tinyInt1isBit=false";
+            + "&zeroDateTimeBehavior=CONVERT_TO_NULL&tinyInt1isBit=false&yearIsDateType=false";
 
     private static final String QUOTE = "`";
+
+    private static final String DEFAULT_CONNECT_TIMEOUT_MS = "30000";
+
+    private static final String STORED_COLUMNS_ATTRIBUTE = "tidb.stored.columns";
+
+    private final TiDbConnectorConfig connectorConfig;
 
     public TiDbConnection(TiDbConnectorConfig connectorConfig) {
         super(jdbcConfig(connectorConfig),
                 patternBasedFactory(URL_PATTERN, "com.mysql.cj.jdbc.Driver", TiDbConnection.class.getClassLoader()),
                 QUOTE, QUOTE);
+        this.connectorConfig = connectorConfig;
     }
 
     private static JdbcConfiguration jdbcConfig(TiDbConnectorConfig connectorConfig) {
         // The port default lives on the connector's Field definition and does not travel through
-        // the raw config subset, so it is applied here for the JDBC url
+        // the raw config subset, so it is applied here for the JDBC url. The remaining defaults
+        // mirror the MySQL connector: a bounded connect timeout, streamed result sets unless a
+        // positive fetch size asks for a server side cursor, and the driver features that load
+        // local files or deserialize objects switched off.
         return JdbcConfiguration.copy(connectorConfig.getJdbcConfig())
                 .withDefault(JdbcConfiguration.PORT, TiDbConnectorConfig.JDBC_PORT.defaultValue())
+                .withDefault("connectTimeout", DEFAULT_CONNECT_TIMEOUT_MS)
+                .withDefault("useCursorFetch", connectorConfig.getSnapshotFetchSize() > 0)
+                .with("allowLoadLocalInfile", Boolean.FALSE.toString())
+                .with("allowUrlInLocalInfile", Boolean.FALSE.toString())
+                .with("autoDeserialize", Boolean.FALSE.toString())
+                .without("queryInterceptors")
                 .build();
     }
 
@@ -95,13 +120,42 @@ public class TiDbConnection extends JdbcConnection {
     }
 
     /**
+     * Reads the structure of the given table as it was at the given TSO. Used by the streaming
+     * source, whose events can be older than the current table structure; the session is reset
+     * to read current data afterwards.
+     *
+     * @return the relational model of the table, or empty if the table did not exist at that TSO
+     */
+    public Optional<Table> readTableStructureAt(TableId tableId, long tso) throws SQLException {
+        execute("SET SESSION tidb_snapshot = '" + tso + "'");
+        try {
+            return findTableStructure(tableId);
+        }
+        finally {
+            execute("SET SESSION tidb_snapshot = ''");
+        }
+    }
+
+    /**
      * @return the relational model of the given table, read from {@code information_schema}
      */
     public Table readTableStructure(TableId tableId) throws SQLException {
+        return findTableStructure(tableId).orElseThrow(
+                () -> new DebeziumException("Table " + tableId + " has no columns in information_schema, it may have been dropped"));
+    }
+
+    /**
+     * Reads the relational model of a table the way TiCDC describes it: virtual generated columns
+     * come after all stored columns, as in TiCDC's row schema, where they are always null; and the
+     * key is the primary key or, without one, the unique index TiCDC picks as the handle key.
+     */
+    public Optional<Table> findTableStructure(TableId tableId) throws SQLException {
         final TableEditor editor = Table.editor().tableId(tableId);
         final List<String> primaryKeyNames = new ArrayList<>();
+        final Set<String> notNullColumns = new HashSet<>();
+        final List<ColumnEditor> virtualColumns = new ArrayList<>();
         prepareQuery("SELECT column_name, data_type, column_type, column_key, is_nullable,"
-                + " numeric_precision, numeric_scale, datetime_precision"
+                + " numeric_precision, numeric_scale, datetime_precision, column_default, extra"
                 + " FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
                 statement -> {
                     statement.setString(1, tableId.catalog());
@@ -111,14 +165,17 @@ public class TiDbConnection extends JdbcConnection {
                     int position = 1;
                     while (rs.next()) {
                         final String name = rs.getString(1);
-                        final String dataType = rs.getString(2).toLowerCase();
+                        final String extra = rs.getString(10);
+                        final boolean virtual = extra != null && extra.toUpperCase(Locale.ROOT).contains("VIRTUAL GENERATED");
+                        final String dataType = rs.getString(2).toLowerCase(Locale.ROOT);
                         final String columnType = rs.getString(3);
+                        final boolean optional = "YES".equalsIgnoreCase(rs.getString(5));
                         final ColumnEditor column = Column.editor()
                                 .name(name)
-                                .type(columnType.toLowerCase())
+                                .type(columnType.toLowerCase(Locale.ROOT))
                                 .jdbcType(jdbcTypeFor(dataType))
-                                .optional("YES".equalsIgnoreCase(rs.getString(5)))
-                                .position(position++);
+                                .optional(optional)
+                                .generated(extra != null && extra.toUpperCase(Locale.ROOT).contains("GENERATED"));
                         switch (dataType) {
                             case "bit":
                                 column.length(rs.getInt(6));
@@ -142,46 +199,116 @@ public class TiDbConnection extends JdbcConnection {
                             default:
                                 break;
                         }
-                        editor.addColumn(column.create());
+                        final String defaultValue = rs.getString(9);
+                        if (defaultValue != null) {
+                            column.defaultValueExpression(defaultValue);
+                        }
+                        if (virtual) {
+                            virtualColumns.add(column);
+                            continue;
+                        }
+                        editor.addColumn(column.position(position++).create());
                         if ("PRI".equalsIgnoreCase(rs.getString(4))) {
                             primaryKeyNames.add(name);
+                        }
+                        if (!optional) {
+                            notNullColumns.add(name);
                         }
                     }
                 });
         if (editor.columns().isEmpty()) {
-            throw new DebeziumException("Table " + tableId + " has no columns in information_schema, it may have been dropped");
+            return Optional.empty();
+        }
+        final int storedColumns = editor.columns().size();
+        for (ColumnEditor column : virtualColumns) {
+            editor.addColumn(column.position(editor.columns().size() + 1).create());
+        }
+        editor.addAttribute(Attribute.editor().name(STORED_COLUMNS_ATTRIBUTE).value(storedColumns).create());
+        if (primaryKeyNames.isEmpty()) {
+            primaryKeyNames.addAll(handleKeyColumns(tableId, editor, notNullColumns));
         }
         editor.setPrimaryKeyNames(primaryKeyNames);
-        return editor.create();
+        return Optional.of(editor.create());
+    }
+
+    /**
+     * Picks the unique index that TiCDC uses as the handle key of a table without a primary key:
+     * among the unique indexes whose columns are all NOT NULL and stored, the one with the fewest
+     * columns, and among those the one created first. The columns are returned in table order,
+     * which is the order in which TiCDC writes the message key.
+     */
+    private List<String> handleKeyColumns(TableId tableId, TableEditor table, Set<String> notNullColumns) throws SQLException {
+        final Map<Long, List<String>> uniqueIndexes = new TreeMap<>();
+        final Set<Long> ineligible = new HashSet<>();
+        prepareQuery("SELECT index_id, column_name FROM information_schema.tidb_indexes"
+                + " WHERE table_schema = ? AND table_name = ? AND non_unique = 0 ORDER BY index_id, seq_in_index",
+                statement -> {
+                    statement.setString(1, tableId.catalog());
+                    statement.setString(2, tableId.table());
+                },
+                rs -> {
+                    while (rs.next()) {
+                        final long indexId = rs.getLong(1);
+                        final String columnName = rs.getString(2);
+                        // Expression indexes have no column name; virtual generated columns are
+                        // never NOT NULL members here because they are not added to that set
+                        if (columnName == null || !notNullColumns.contains(columnName)) {
+                            ineligible.add(indexId);
+                        }
+                        uniqueIndexes.computeIfAbsent(indexId, id -> new ArrayList<>()).add(columnName);
+                    }
+                });
+        List<String> best = null;
+        for (Map.Entry<Long, List<String>> index : uniqueIndexes.entrySet()) {
+            if (!ineligible.contains(index.getKey()) && (best == null || index.getValue().size() < best.size())) {
+                best = index.getValue();
+            }
+        }
+        if (best == null) {
+            return List.of();
+        }
+        final Set<String> keyColumns = new HashSet<>(best);
+        return table.columns().stream()
+                .map(Column::name)
+                .filter(keyColumns::contains)
+                .toList();
     }
 
     /**
      * Runs the given snapshot query and hands every row to the consumer as an array of raw JDBC
      * values in column order.
      */
+    /**
+     * @return the stored columns of a table read by this connection, i.e. all columns except the
+     *         virtual generated ones at the end, which cannot be selected meaningfully and which
+     *         TiCDC always reports as null
+     */
+    public static List<Column> storedColumns(Table table) {
+        final Attribute storedColumns = table.attributeWithName(STORED_COLUMNS_ATTRIBUTE);
+        return storedColumns == null ? table.columns() : table.columns().subList(0, storedColumns.asInteger());
+    }
+
     public void fetchRows(String snapshotQuery, List<Column> columns, RowConsumer consumer) throws SQLException, InterruptedException {
-        try {
-            query(snapshotQuery, rs -> {
-                try {
-                    while (rs.next()) {
-                        final Object[] row = new Object[columns.size()];
-                        for (int i = 0; i < row.length; i++) {
-                            row[i] = readColumnValue(rs, i + 1, columns.get(i));
-                        }
-                        consumer.accept(row);
-                    }
+        fetchRows(snapshotQuery, columns, columns.size(), consumer);
+    }
+
+    /**
+     * Runs the given snapshot query and hands every row to the consumer as an array of the given
+     * width; the selected columns fill its start, any remaining entries stay null.
+     */
+    public void fetchRows(String snapshotQuery, List<Column> columns, int rowWidth, RowConsumer consumer) throws SQLException, InterruptedException {
+        // The statement applies snapshot.fetch.size: the default streams rows one by one instead
+        // of reading the whole table into memory, a positive value fetches through a server side
+        // cursor in batches of that size
+        try (Statement statement = readTableStatement(connectorConfig, OptionalLong.empty());
+                ResultSet rs = statement.executeQuery(snapshotQuery)) {
+            while (rs.next()) {
+                final Object[] row = new Object[rowWidth];
+                for (int i = 0; i < columns.size(); i++) {
+                    row[i] = readColumnValue(rs, i + 1, columns.get(i));
                 }
-                catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new SQLException(e);
-                }
-            });
-        }
-        catch (SQLException e) {
-            if (e.getCause() instanceof InterruptedException interrupted) {
-                throw interrupted;
+                consumer.accept(row);
             }
-            throw e;
         }
     }
 

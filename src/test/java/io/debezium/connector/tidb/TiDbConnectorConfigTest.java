@@ -129,4 +129,47 @@ public class TiDbConnectorConfigTest {
         assertThat(TiDbConnectorConfig.isBuiltInDatabase("metrics_schema")).isTrue();
         assertThat(TiDbConnectorConfig.isBuiltInDatabase("inventory")).isFalse();
     }
+
+    private static boolean isValid(Configuration.Builder config) {
+        return config.build().validateAndRecord(TiDbConnectorConfig.ALL_FIELDS, error -> {
+        });
+    }
+
+    @Test
+    public void shouldRejectOptionsTheTiCdcEncodingFixes() {
+        assertThat(isValid(minimalConfig().with("decimal.handling.mode", "precise"))).isFalse();
+        assertThat(isValid(minimalConfig().with("decimal.handling.mode", "double"))).isTrue();
+        assertThat(isValid(minimalConfig().with("time.precision.mode", "connect"))).isFalse();
+        assertThat(isValid(minimalConfig().with("time.precision.mode", "adaptive_time_microseconds"))).isTrue();
+        assertThat(isValid(minimalConfig().with("binary.handling.mode", "bytes"))).isFalse();
+        assertThat(isValid(minimalConfig().with("binary.handling.mode", "base64"))).isTrue();
+    }
+
+    @Test
+    public void shouldRejectUnsupportedOptions() {
+        assertThat(isValid(minimalConfig().with("converters", "custom"))).isFalse();
+        assertThat(isValid(minimalConfig().with("heartbeat.action.query", "SELECT 1"))).isFalse();
+        assertThat(isValid(minimalConfig().with("include.schema.comments", "true"))).isFalse();
+    }
+
+    @Test
+    public void shouldRequireSqlEndpointForColumnMappers() {
+        assertThat(isValid(minimalConfig().with("column.mask.with.5.chars", "inventory\\.customers\\.email"))).isFalse();
+        assertThat(isValid(minimalConfig().with("column.truncate.to.10.chars", "inventory\\.customers\\.name"))).isFalse();
+        assertThat(isValid(minimalConfig().with("column.propagate.source.type", ".*"))).isFalse();
+        assertThat(isValid(minimalConfig()
+                .with("column.mask.with.5.chars", "inventory\\.customers\\.email")
+                .with(TiDbConnectorConfig.JDBC_HOSTNAME, "localhost")
+                .with(TiDbConnectorConfig.JDBC_USER, "root"))).isTrue();
+        // Column filters and key columns only need the column names, which TiCDC provides
+        assertThat(isValid(minimalConfig()
+                .with("column.exclude.list", "inventory\\.customers\\.email")
+                .with("message.key.columns", "inventory.customers:id"))).isTrue();
+    }
+
+    @Test
+    public void shouldStreamSnapshotRowsByDefault() {
+        final TiDbConnectorConfig config = new TiDbConnectorConfig(minimalConfig().build());
+        assertThat(config.getSnapshotFetchSize()).isEqualTo(Integer.MIN_VALUE);
+    }
 }

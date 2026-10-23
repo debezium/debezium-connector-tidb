@@ -21,6 +21,10 @@ Then build the connector (add `-Passembly` to also produce the connector plugin 
 ./mvnw clean verify
 ```
 
+The integration tests start a TiDB cluster (PD, TiKV, TiDB), a TiCDC server and a Kafka broker
+with Testcontainers, so they need Docker. Skip them with `-DskipITs`. The TiDB version under test
+can be changed with `-Dtidb.version=v8.5.1`.
+
 ## Architecture (phase 1)
 
 TiDB does not expose a MySQL binlog and the only consumer of TiKV's raw `EventFeed` gRPC API is
@@ -81,6 +85,27 @@ The snapshot session must stay within the GC lifetime of the cluster (`tidb_gc_l
 rejects `tidb_snapshot` reads older than the GC safe point, so very long snapshots need a longer
 GC lifetime for their duration.
 
+Rows are streamed from the server one by one rather than read into memory a table at a time.
+Setting `snapshot.fetch.size` to a positive value fetches them through a server side cursor in
+batches of that size instead.
+
+Snapshot rows use the same encoding as TiCDC's Debezium output, so a table has one schema across
+the hand off from snapshot to streaming. This includes the TiCDC conventions for zero dates
+(`0000-00-00` is the epoch in NOT NULL columns and null otherwise), for column defaults, for
+virtual generated columns (listed after all other columns and always null) and for the message
+key of tables without a primary key (the unique index on NOT NULL columns that TiCDC uses).
+TiCDC does not stream tables that have neither a primary key nor such an index unless the
+changefeed sets `force-replicate`; the snapshot logs a warning for them.
+
+`snapshot.include.collection.list` limits the initial snapshot to some of the captured tables.
+`snapshot.select.statement.overrides` is not supported: the snapshot logs a warning and reads all
+rows of the tables.
+
+An on demand snapshot is started with an `execute-snapshot` signal of type `blocking`, for
+example through a signal table named in `signal.data.collection` that the changefeed captures.
+Streaming pauses while it runs. The `additional-conditions` of the signal give a full select
+statement per table, which has to return all columns of the table in table order.
+
 Encryption of the snapshot connection follows the MySQL driver default: TLS is negotiated when
 the server supports it. Additional driver settings can be passed through with the `database.`
 prefix, for example `database.sslMode=VERIFY_CA` to require a verified TLS connection. The
@@ -113,8 +138,23 @@ Minimal example:
 | `database.user` | — | User for the TiDB SQL endpoint. Required for `initial` and `initial_only`. |
 | `database.password` | — | Password for the TiDB SQL endpoint. |
 
-All common Debezium options (`table.include.list`, `topic.naming.strategy`, `tombstones.on.delete`,
-SMTs, ...) apply as usual.
+The common Debezium options apply to snapshot and streaming events alike: table and column
+filters, `message.key.columns`, `column.mask.*`, `column.truncate.*`, `column.propagate.source.type`,
+`datatype.propagate.source.type`, `tombstones.on.delete`, `skipped.operations`,
+`skip.messages.without.change`, `event.processing.failure.handling.mode`, topic naming, signals,
+notifications and SMTs. Streamed rows go through the same table schema as snapshot rows, so these
+options give the same result in both. Column masking, truncation and source type propagation need
+the source column types, which TiCDC's messages do not carry, so they require `database.hostname`
+and `database.user` even with `snapshot.mode=no_data`.
+
+Some options are rejected at validation because the TiCDC encoding fixes their behavior or the
+connector does not support them: `decimal.handling.mode` other than `double`,
+`time.precision.mode` other than `adaptive_time_microseconds`, `binary.handling.mode` other than
+`base64`, `converters`, `heartbeat.action.query` and `include.schema.comments=true`.
+`snapshot.max.threads` above 1 and `snapshot.tables.order.by.row.count` are accepted but have no
+effect; the snapshot logs a warning for them.
+
+The snapshot connection sets `connectTimeout=30000` unless `database.connectTimeout` is given.
 
 ## Roadmap
 
@@ -140,6 +180,9 @@ Per the maintainer guidance in DBZ-6269:
 * An on demand (blocking) snapshot through the `execute-snapshot` signal snapshots only the
   requested tables and does not move the streaming position; streamed changes of those tables
   that occurred while streaming was paused are emitted again after the snapshot.
+* TiCDC replaces an explicit NULL with the column default when it encodes a row. The snapshot
+  emits the NULL that is stored, so for nullable columns that have a default, a NULL value reads
+  differently in snapshot and streamed events.
 * DDL and watermark events (TiCDC v9+) are skipped; schema changes are picked up lazily from the
   data messages.
 * Single task; parallelism is bounded by the TiCDC topic partitioning for now.

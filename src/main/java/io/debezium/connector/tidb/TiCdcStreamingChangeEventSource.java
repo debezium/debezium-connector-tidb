@@ -30,6 +30,7 @@ import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.monitor.OffsetActivityMonitor;
 import io.debezium.pipeline.monitor.OffsetActivityMonitorService;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
+import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.util.Clock;
 
@@ -84,17 +85,27 @@ public class TiCdcStreamingChangeEventSource implements StreamingChangeEventSour
         final TiDbOffsetContext effectiveOffset = this.effectiveOffsetContext;
 
         try (TiCdcEventParser parser = new TiCdcEventParser();
-                Consumer<byte[], byte[]> consumer = createConsumer()) {
+                Consumer<byte[], byte[]> consumer = createConsumer();
+                TiCdcTableResolver tableResolver = createTableResolver()) {
 
             seekToStartPosition(consumer, effectiveOffset);
 
             while (context.isRunning()) {
+                if (context.isPaused()) {
+                    // A blocking snapshot runs; the consumer keeps its position and resumes from
+                    // there once the snapshot completed
+                    LOGGER.info("Streaming will now pause");
+                    context.streamingPaused();
+                    context.waitSnapshotCompletion();
+                    LOGGER.info("Streaming resumed");
+                }
+
                 final ConsumerRecords<byte[], byte[]> records = consumer.poll(connectorConfig.getTicdcPollTimeout());
                 for (ConsumerRecord<byte[], byte[]> record : records) {
                     if (!context.isRunning()) {
                         return;
                     }
-                    processRecord(parser, partition, effectiveOffset, record);
+                    processRecord(parser, tableResolver, partition, effectiveOffset, record);
                 }
 
                 offsetActivityMonitorService.pulse(partition, effectiveOffset);
@@ -114,10 +125,10 @@ public class TiCdcStreamingChangeEventSource implements StreamingChangeEventSour
         }
     }
 
-    private void processRecord(TiCdcEventParser parser, TiDbPartition partition, TiDbOffsetContext offsetContext,
-                               ConsumerRecord<byte[], byte[]> record)
+    private void processRecord(TiCdcEventParser parser, TiCdcTableResolver tableResolver, TiDbPartition partition,
+                               TiDbOffsetContext offsetContext, ConsumerRecord<byte[], byte[]> record)
             throws InterruptedException {
-        final TiCdcEvent event = parser.parse(record.topic(), record.key(), record.value());
+        final TiCdcEvent event = parse(parser, record);
         if (event == null) {
             // Still advance the stream position so non data change messages are not re-read on restart
             offsetContext.event(null, clock.currentTimeAsInstant(), offsetContext.getCommitTs(), null,
@@ -138,10 +149,57 @@ public class TiCdcStreamingChangeEventSource implements StreamingChangeEventSour
         final TableId tableId = event.tableId();
         offsetContext.event(tableId, event.sourceTimestamp(), event.commitTs(), event.clusterId(),
                 record.topic(), record.partition(), record.offset() + 1);
-        schema.refresh(tableId, event.keySchema(), event.rowSchema());
+
+        // Excluded tables are filtered by the dispatcher and need no table model
+        Table table = null;
+        if (connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
+            table = schema.isCurrentForStream(tableId, event.keySchema(), event.rowSchema())
+                    ? schema.tableFor(tableId).orElseThrow()
+                    : refreshSchema(tableResolver, event);
+        }
 
         dispatcher.dispatchDataChangeEvent(partition, tableId,
-                new TiDbChangeRecordEmitter(partition, offsetContext, clock, connectorConfig, event));
+                new TiDbChangeRecordEmitter(partition, offsetContext, clock, connectorConfig, event, table));
+    }
+
+    private Table refreshSchema(TiCdcTableResolver tableResolver, TiCdcEvent event) {
+        final Table table = tableResolver.resolve(event);
+        schema.refreshFromStream(table, event.keySchema(), event.rowSchema());
+        return table;
+    }
+
+    /**
+     * Parses a TiCDC message, applying {@code event.processing.failure.handling.mode} to messages
+     * that cannot be parsed.
+     *
+     * @return the parsed event, or {@code null} if the message carries no data change or is skipped
+     */
+    private TiCdcEvent parse(TiCdcEventParser parser, ConsumerRecord<byte[], byte[]> record) {
+        try {
+            return parser.parse(record.topic(), record.key(), record.value());
+        }
+        catch (RuntimeException e) {
+            final String position = record.topic() + "-" + record.partition() + "@" + record.offset();
+            switch (connectorConfig.getEventProcessingFailureHandlingMode()) {
+                case WARN:
+                    LOGGER.warn("Skipping TiCDC message at {} that could not be parsed", position, e);
+                    return null;
+                case SKIP:
+                case IGNORE:
+                    LOGGER.debug("Skipping TiCDC message at {} that could not be parsed", position, e);
+                    return null;
+                default:
+                    throw new DebeziumException("Failed to parse TiCDC message at " + position, e);
+            }
+        }
+    }
+
+    /**
+     * Creates the resolver of the table models of streamed tables. Visible so that tests can
+     * substitute one that works without a SQL endpoint.
+     */
+    protected TiCdcTableResolver createTableResolver() {
+        return new TiCdcTableResolver(connectorConfig);
     }
 
     /**

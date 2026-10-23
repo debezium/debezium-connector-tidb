@@ -9,26 +9,31 @@ import org.apache.kafka.connect.data.Struct;
 
 import io.debezium.connector.tidb.ticdc.TiCdcEvent;
 import io.debezium.data.Envelope.Operation;
-import io.debezium.pipeline.AbstractChangeRecordEmitter;
 import io.debezium.pipeline.spi.OffsetContext;
+import io.debezium.relational.Column;
+import io.debezium.relational.RelationalChangeRecordEmitter;
+import io.debezium.relational.Table;
 import io.debezium.util.Clock;
 
 /**
- * Emits change records for data changes consumed from the TiCDC stream. The typed row images of
- * the TiCDC message are re-wrapped into the connector's own envelope so that the {@code source}
- * block carries the real TiDB position (TSO commit timestamp) instead of the MySQL-flavoured
- * dummies of TiCDC's Debezium output mode.
+ * Emits change records for data changes consumed from the TiCDC stream. The row images of the
+ * TiCDC message are laid out as column values of the table model, so that they go through the
+ * same table schema as snapshot rows: the configured column filters, column mappers and key
+ * columns apply, and the {@code source} block carries the real TiDB position (TSO commit
+ * timestamp) instead of the MySQL flavoured dummies of TiCDC's Debezium output mode.
  *
  * @author Aviral Srivastava
  */
-public class TiDbChangeRecordEmitter extends AbstractChangeRecordEmitter<TiDbPartition, TiDbTableSchema> {
+public class TiDbChangeRecordEmitter extends RelationalChangeRecordEmitter<TiDbPartition> {
 
     private final TiCdcEvent event;
+    private final Table table;
 
     public TiDbChangeRecordEmitter(TiDbPartition partition, OffsetContext offsetContext, Clock clock,
-                                   TiDbConnectorConfig connectorConfig, TiCdcEvent event) {
+                                   TiDbConnectorConfig connectorConfig, TiCdcEvent event, Table table) {
         super(partition, offsetContext, clock, connectorConfig);
         this.event = event;
+        this.table = table;
     }
 
     @Override
@@ -37,30 +42,25 @@ public class TiDbChangeRecordEmitter extends AbstractChangeRecordEmitter<TiDbPar
     }
 
     @Override
-    protected void emitReadRecord(Receiver<TiDbPartition> receiver, TiDbTableSchema schema) throws InterruptedException {
-        final Struct envelope = schema.getEnvelopeSchema().read(
-                event.after(), getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
-        receiver.changeRecord(getPartition(), schema, Operation.READ, event.key(), envelope, getOffset(), null);
+    protected Object[] getOldColumnValues() {
+        return columnValues(event.before());
     }
 
     @Override
-    protected void emitCreateRecord(Receiver<TiDbPartition> receiver, TiDbTableSchema schema) throws InterruptedException {
-        final Struct envelope = schema.getEnvelopeSchema().create(
-                event.after(), getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
-        receiver.changeRecord(getPartition(), schema, Operation.CREATE, event.key(), envelope, getOffset(), null);
+    protected Object[] getNewColumnValues() {
+        return columnValues(event.after());
     }
 
-    @Override
-    protected void emitUpdateRecord(Receiver<TiDbPartition> receiver, TiDbTableSchema schema) throws InterruptedException {
-        final Struct envelope = schema.getEnvelopeSchema().update(
-                event.before(), event.after(), getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
-        receiver.changeRecord(getPartition(), schema, Operation.UPDATE, event.key(), envelope, getOffset(), null);
-    }
-
-    @Override
-    protected void emitDeleteRecord(Receiver<TiDbPartition> receiver, TiDbTableSchema schema) throws InterruptedException {
-        final Struct envelope = schema.getEnvelopeSchema().delete(
-                event.before(), getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
-        receiver.changeRecord(getPartition(), schema, Operation.DELETE, event.key(), envelope, getOffset(), null);
+    private Object[] columnValues(Struct row) {
+        if (row == null) {
+            return null;
+        }
+        final Object[] values = new Object[table.columns().size()];
+        for (Column column : table.columns()) {
+            if (row.schema().field(column.name()) != null) {
+                values[column.position() - 1] = row.get(column.name());
+            }
+        }
+        return values;
     }
 }

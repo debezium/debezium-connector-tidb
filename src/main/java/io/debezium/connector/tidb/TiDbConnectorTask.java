@@ -72,7 +72,7 @@ public class TiDbConnectorTask extends BaseSourceTask<TiDbPartition, TiDbOffsetC
         final TopicNamingStrategy<TableId> topicNamingStrategy = connectorConfig.getTopicNamingStrategy(TiDbConnectorConfig.TOPIC_NAMING_STRATEGY);
         final Clock clock = Clock.system();
 
-        this.schema = new TiDbSchema(topicNamingStrategy, connectorConfig.getSourceInfoStructMaker().schema(), schemaNameAdjuster);
+        this.schema = new TiDbSchema(connectorConfig, topicNamingStrategy);
 
         final Offsets<TiDbPartition, TiDbOffsetContext> previousOffsets = getPreviousOffsets(
                 new TiDbPartition.Provider(connectorConfig), new TiDbOffsetContext.Loader(connectorConfig));
@@ -129,7 +129,7 @@ public class TiDbConnectorTask extends BaseSourceTask<TiDbPartition, TiDbOffsetC
                 TiDbConnector.class,
                 connectorConfig,
                 new TiDbChangeEventSourceFactory(connectorConfig, errorHandler, dispatcher, clock, schema,
-                        topicNamingStrategy, snapshotterService),
+                        snapshotterService),
                 new DefaultChangeEventSourceMetricsFactory<>(),
                 dispatcher,
                 schema,
