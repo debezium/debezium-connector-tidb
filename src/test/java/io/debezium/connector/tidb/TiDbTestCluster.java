@@ -25,6 +25,8 @@ import org.testcontainers.containers.output.Slf4jLogConsumer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.images.builder.Transferable;
 
+import com.github.dockerjava.api.model.Ulimit;
+
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 
@@ -43,8 +45,10 @@ public final class TiDbTestCluster {
     private static final String KAFKA_IMAGE = "apache/kafka:3.9.0";
     private static final String KAFKA_INTERNAL_LISTENER = "kafka:19092";
     private static final Duration STARTUP_TIMEOUT = Duration.ofMinutes(3);
+    private static final long TIKV_MAX_OPEN_FILES = 1_048_576L;
 
     private static TiDbTestCluster instance;
+    private static RuntimeException startupFailure;
 
     private final Network network = Network.newNetwork();
     private final GenericContainer<?> pd;
@@ -67,6 +71,10 @@ public final class TiDbTestCluster {
                 .withNetworkAliases("tikv")
                 .withCommand("--addr=0.0.0.0:20160", "--advertise-addr=tikv:20160", "--status-addr=0.0.0.0:20180",
                         "--pd=pd:2379", "--data-dir=/data/tikv")
+                // TiKV refuses to start with fewer open files than it may need (about 124k in
+                // v8.5), above the 65536 default of some Docker hosts such as the CI runners
+                .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
+                        .withUlimits(new Ulimit[]{ new Ulimit("nofile", TIKV_MAX_OPEN_FILES, TIKV_MAX_OPEN_FILES) }))
                 .waitingFor(Wait.forLogMessage(".*TiKV is ready to serve.*", 1).withStartupTimeout(STARTUP_TIMEOUT));
         tidb = new GenericContainer<>("pingcap/tidb:" + TIDB_VERSION)
                 .withNetwork(network)
@@ -102,13 +110,23 @@ public final class TiDbTestCluster {
     }
 
     /**
-     * @return the running cluster, started on first use and stopped when the JVM exits
+     * @return the running cluster, started on first use and stopped when the JVM exits. A failed
+     *         start is reported to every later caller instead of being retried for each test.
      */
     public static synchronized TiDbTestCluster get() {
+        if (startupFailure != null) {
+            throw new IllegalStateException("The TiDB test cluster failed to start", startupFailure);
+        }
         if (instance == null) {
             final TiDbTestCluster cluster = new TiDbTestCluster();
-            cluster.start();
             Runtime.getRuntime().addShutdownHook(new Thread(cluster::stop));
+            try {
+                cluster.start();
+            }
+            catch (RuntimeException e) {
+                startupFailure = e;
+                throw e;
+            }
             instance = cluster;
         }
         return instance;

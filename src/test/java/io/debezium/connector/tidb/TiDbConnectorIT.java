@@ -61,6 +61,10 @@ public class TiDbConnectorIT extends AbstractAsyncEngineConnectorTest {
     @AfterEach
     public void afterEach() throws Exception {
         stopConnector();
+        if (cluster == null) {
+            // The cluster failed to start
+            return;
+        }
         try {
             cluster.removeChangefeed(changefeed);
         }
