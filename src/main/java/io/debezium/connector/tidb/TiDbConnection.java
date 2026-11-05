@@ -275,10 +275,6 @@ public class TiDbConnection extends JdbcConnection {
     }
 
     /**
-     * Runs the given snapshot query and hands every row to the consumer as an array of raw JDBC
-     * values in column order.
-     */
-    /**
      * @return the stored columns of a table read by this connection, i.e. all columns except the
      *         virtual generated ones at the end, which cannot be selected meaningfully and which
      *         TiCDC always reports as null
@@ -288,6 +284,10 @@ public class TiDbConnection extends JdbcConnection {
         return storedColumns == null ? table.columns() : table.columns().subList(0, storedColumns.asInteger());
     }
 
+    /**
+     * Runs the given snapshot query and hands every row to the consumer as an array of raw JDBC
+     * values in column order.
+     */
     public void fetchRows(String snapshotQuery, List<Column> columns, RowConsumer consumer) throws SQLException, InterruptedException {
         fetchRows(snapshotQuery, columns, columns.size(), consumer);
     }
