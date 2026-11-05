@@ -25,10 +25,6 @@
     <properties>
         <!-- Debezium parent -->
         <version.debezium>${project.version}</version.debezium>
-
-        <!-- Candidate for central maintenance in debezium-parent, like the other driver versions;
-             the tidb specifier allows divergence from the standard MySQL driver if needed -->
-        <version.tidb.driver>9.4.0</version.tidb.driver>
     </properties>
 
     <repositories>
